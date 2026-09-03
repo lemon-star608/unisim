@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.1.3+simtoolreal.1 - 2026-09-07
 
 - Add MuJoCo startup model-source variants to `ModelVariantSpec`, compiled on
   the cold path and assigned through the vectorized model pool.
 - Add the backend-neutral `SimBackend.get_step_autoreset_mask()` event
   contract, including MuJoCo per-substep OR latching when supported by the
   installed batch runtime.
+- Resolve `mujoco-uni-runtime==0.5.0+simtoolreal.1` from the
+  `feat/simtoolreal-minimal` Git branch instead of a local checkout.
 
 ## 1.1.3 - 2026-09-06
 
