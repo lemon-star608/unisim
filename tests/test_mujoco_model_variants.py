@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import mujoco
 import numpy as np
 import pytest
+
+mujoco = pytest.importorskip("mujoco")
 
 from unisim import MuJoCoBackend
 from unisim.backend.base import SimBackend
