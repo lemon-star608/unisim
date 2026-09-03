@@ -37,3 +37,13 @@ the builtin term specs, routes it to the matching handler, and fails closed
 with `NotImplementedError` for any term a backend does not declare. Custom
 terms are free-form strings owned by the registering backend and validated
 only against its capability set.
+
+MuJoCo startup randomization may provide a `ModelVariantSpec` with a
+`source_model_file`. The adapter compiles each source XML during
+`apply_init_randomization`, applies the variant's cached overrides, and passes
+the resulting model sequence to `BatchEnvPool` during `materialize`; XML files
+are never resolved from the step or reset path. A MuJoCo runtime that exposes
+the public `BatchEnvPool.was_autoreset` property also reports the per-step
+autoreset mask through `SimBackend.get_step_autoreset_mask()`. Older runtimes
+return `None` for that optional event rather than claiming that no autoreset
+occurred.

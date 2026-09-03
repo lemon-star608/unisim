@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add MuJoCo startup model-source variants to `ModelVariantSpec`, compiled on
+  the cold path and assigned through the vectorized model pool.
+- Add the backend-neutral `SimBackend.get_step_autoreset_mask()` event
+  contract, including MuJoCo per-substep OR latching when supported by the
+  installed batch runtime.
+
 ## 1.1.3 - 2026-09-06
 
 - Ensure Newton ViewerGL playback shows authored static planes and supplies a

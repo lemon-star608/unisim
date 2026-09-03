@@ -549,6 +549,14 @@ class SimBackend(abc.ABC):
             per-phase timings in milliseconds.
         """
 
+    def get_step_autoreset_mask(self) -> np.ndarray | None:
+        """Report environments silently reset by the engine during the last step.
+
+        ``None`` means that the backend cannot report this event. It does not
+        mean that the last step completed without an autoreset.
+        """
+        return None
+
     def set_pre_step_control(self, fn: PreStepControlFn | None) -> None:
         """Register an env-owned policy-control to physics-control converter.
 

@@ -24,3 +24,19 @@ Runtime-owned caches and worker installations use the `UNISIM_*` environment
 variables and `~/.cache/unisim` defaults. The previous `UNILAB_*` names are
 accepted only as migration fallbacks so existing installations can move
 without losing cached state.
+
+## Startup model variants and engine autoreset
+
+The MuJoCo adapter accepts source-model identity as part of
+`ModelVariantSpec`. UniLab can therefore assign a different, compatible XML
+model to each vectorized environment during startup randomization. Compilation
+and model metadata resolution happen before pool materialization; the hot
+`step`/`reset` path only uses the materialized sequence and integer assignments.
+
+When the installed MuJoCo batch runtime exposes its public `was_autoreset`
+property, `MuJoCoBackend.get_step_autoreset_mask()` returns the exact
+environment mask for the most recent logical step. The adapter clears the
+mask at the start of each logical step and OR-latches each physics substep.
+Runtimes without that property report `None`, preserving an explicit
+"unknown" result for callers that need to distinguish unsupported reporting
+from an all-false mask.

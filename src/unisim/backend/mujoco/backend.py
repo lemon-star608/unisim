@@ -368,6 +368,7 @@ class MuJoCoBackend(SimBackend):
         self._np_dtype = np_dtype if np_dtype is not None else get_global_dtype()
         self.backend_type = "mujoco"
         self._pending_xfrc_applied = np.zeros((num_envs, 6 * self._model.nbody), dtype=np.float64)
+        self._autoreset_mask = np.zeros((num_envs,), dtype=bool)
 
         # Thread configuration. An explicit ``cpu_ids`` affinity pins one worker
         # per CPU, so it also fixes the pool worker count. Otherwise size the
@@ -381,6 +382,7 @@ class MuJoCoBackend(SimBackend):
         self._model_variants: tuple[mujoco.MjModel, ...] = (self._model,)
         self._model_assignments = np.zeros((num_envs,), dtype=np.int32)
         self._pool: BatchEnvPool | None = None
+        self._pool_supports_autoreset = False
         # State indices.
         self.nq = self._model.nq
         self.nv = self._model.nv
@@ -592,6 +594,24 @@ class MuJoCoBackend(SimBackend):
                             os.rmdir(parent)
                         except OSError:
                             pass
+
+        if any(variant.source_model_file is not None for variant in variants):
+            compiled: list[mujoco.MjModel] = []
+            for variant in variants:
+                source_file = variant.source_model_file or self._model_file
+                paths = _compile_model_variant_chunk_to_mjb(
+                    model_file=source_file,
+                    add_body_sensors=self.add_body_sensors,
+                    base_name=self._base_name,
+                    sim_dt=self._sim_dt,
+                    iterations=self._iterations,
+                    position_actuator_gains=self._position_actuator_gains,
+                    variants=(
+                        ModelVariantSpec(geom_size_overrides=variant.geom_size_overrides),
+                    ),
+                )
+                compiled.extend(_load_compiled_models_and_cleanup(paths))
+            return tuple(compiled)
 
         if len(variants) == 1 or current_process().daemon:
             mjb_paths = _compile_model_variant_chunk_to_mjb(
@@ -987,6 +1007,7 @@ class MuJoCoBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def step(self, ctrl: np.ndarray, nsteps: int = 1) -> dict | None:
+        self._autoreset_mask.fill(False)
         if self._pre_step_control_fn is not None:
             return self._step_with_pre_step_control(ctrl, nsteps)
 
@@ -1012,6 +1033,7 @@ class MuJoCoBackend(SimBackend):
             return_sensor=True,
             post_step_forward_sensor=self._post_step_forward_sensor,
         )
+        self._latch_step_autoreset_mask()
         if control_spec & int(mujoco.mjtState.mjSTATE_XFRC_APPLIED):
             self._pending_xfrc_applied.fill(0.0)
         self._physics_state[:] = state_np.astype(self._np_dtype)
@@ -1028,6 +1050,18 @@ class MuJoCoBackend(SimBackend):
                 "refresh_cache_ms": refresh_cache_ms,
             }
         }
+
+    def get_step_autoreset_mask(self) -> np.ndarray | None:
+        if self._pool is None or not self._pool_supports_autoreset:
+            return None
+        return self._autoreset_mask
+
+    def _latch_step_autoreset_mask(self) -> None:
+        if not self._pool_supports_autoreset:
+            return
+        assert self._pool is not None
+        mask = np.asarray(self._pool.was_autoreset, dtype=bool)
+        np.logical_or(self._autoreset_mask, mask, out=self._autoreset_mask)
 
     def _step_with_pre_step_control(
         self, ctrl: np.ndarray, nsteps: int
@@ -1075,6 +1109,7 @@ class MuJoCoBackend(SimBackend):
             return_sensor=True,
             post_step_forward_sensor=self._post_step_forward_sensor,
         )
+        self._latch_step_autoreset_mask()
         physics_ms = (time.perf_counter() - t0) * 1000.0 - set_ctrl_ms - refresh_cache_ms
 
         if has_pending_xfrc:
@@ -1208,6 +1243,16 @@ class MuJoCoBackend(SimBackend):
         if self._pool is not None:
             raise RuntimeError("MuJoCo backend pool is already materialized")
         self._pool = self._build_pool()
+
+        # ``was_autoreset`` was added to mujoco-uni-runtime after the initial
+        # public pool release. Resolve that optional runtime capability once on
+        # this cold path; step/reset must not probe the runtime dynamically.
+        try:
+            self._pool.was_autoreset
+        except AttributeError:
+            self._pool_supports_autoreset = False
+        else:
+            self._pool_supports_autoreset = True
 
         from unisim.backend.mujoco.chunk_tuner import resolve_chunk_size
 

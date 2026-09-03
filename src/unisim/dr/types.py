@@ -36,10 +36,11 @@ class GeomSizeOverride:
 
 @dataclass(frozen=True)
 class ModelVariantSpec:
+    source_model_file: str | None = None
     geom_size_overrides: tuple[GeomSizeOverride, ...] = field(default_factory=tuple)
 
     def is_empty(self) -> bool:
-        return not self.geom_size_overrides
+        return self.source_model_file is None and not self.geom_size_overrides
 
 
 @dataclass(frozen=True)
