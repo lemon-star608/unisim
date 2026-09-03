@@ -5,12 +5,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-mujoco = pytest.importorskip("mujoco")
-
 from unisim import MuJoCoBackend
 from unisim.backend.base import SimBackend
 from unisim.dr.types import GeomSizeOverride, InitRandomizationPlan, ModelVariantSpec
 from unisim.scene import SceneCfg
+
+mujoco = pytest.importorskip("mujoco")
 
 
 def _write_free_body_model(path: Path, geom: str) -> str:
