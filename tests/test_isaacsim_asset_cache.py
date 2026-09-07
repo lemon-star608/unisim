@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
+import pytest
+
+from unisim.backend.isaacsim import assets as asset_cache
 from unisim.backend.isaacsim.assets import AssetCacheKey, materialize_cached_asset
+from unisim.backend.isaacsim.worker import _resolve_graph_cache_root
 
 
 def _key() -> AssetCacheKey:
@@ -17,6 +23,17 @@ def _key() -> AssetCacheKey:
         importer_options=(("fix_base", "False"),),
         physx_profile="physx-5.6",
     )
+
+
+def test_graph_cache_root_accepts_null_default_and_absolute_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _resolve_graph_cache_root(None) == str(tmp_path / ".cache" / "unisim")
+    explicit = tmp_path / "task-cache"
+    assert _resolve_graph_cache_root(str(explicit)) == str(explicit)
+    with pytest.raises(ValueError, match="absolute or null"):
+        _resolve_graph_cache_root("relative")
 
 
 def test_cache_miss_hit_and_corruption_rebuild(tmp_path: Path) -> None:
@@ -38,6 +55,61 @@ def test_cache_miss_hit_and_corruption_rebuild(tmp_path: Path) -> None:
     rebuilt, hit = materialize_cached_asset(tmp_path, _key(), convert)
     assert rebuilt.read_bytes() == b"usd-data" and hit is False
     assert len(calls) == 2
+
+
+def test_cache_identity_includes_role_conversion_inputs() -> None:
+    base = _key()
+    rigid = AssetCacheKey(**{**base.__dict__, "entity_kind": "rigid", "fixed_base": False})
+    visual = AssetCacheKey(**{**base.__dict__, "entity_kind": "visual", "fixed_base": True})
+    scaled = AssetCacheKey(**{**base.__dict__, "scale": (2.0, 1.0, 1.0)})
+    assert len({base.digest(), rigid.digest(), visual.digest(), scaled.digest()}) == 4
+
+
+def test_concurrent_writer_waits_and_reuses_atomic_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    converting = threading.Event()
+    release = threading.Event()
+    waiter_sleeping = threading.Event()
+    calls: list[Path] = []
+    results: list[tuple[Path, bool]] = []
+    failures: list[BaseException] = []
+    original_sleep = time.sleep
+
+    def observed_sleep(seconds: float) -> None:
+        waiter_sleeping.set()
+        original_sleep(seconds)
+
+    monkeypatch.setattr(asset_cache.time, "sleep", observed_sleep)
+
+    def convert(directory: Path) -> Path:
+        calls.append(directory)
+        converting.set()
+        assert release.wait(timeout=2.0)
+        artifact = directory / "asset.usd"
+        artifact.write_bytes(b"concurrent-usd")
+        return artifact
+
+    def materialize() -> None:
+        try:
+            results.append(materialize_cached_asset(tmp_path, _key(), convert))
+        except BaseException as exc:  # pragma: no cover - assertion reports details
+            failures.append(exc)
+
+    first = threading.Thread(target=materialize)
+    second = threading.Thread(target=materialize)
+    first.start()
+    assert converting.wait(timeout=2.0)
+    second.start()
+    assert waiter_sleeping.wait(timeout=2.0)
+    release.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert failures == []
+    assert len(calls) == 1
+    assert sorted(hit for _, hit in results) == [False, True]
+    assert {path.read_bytes() for path, _ in results} == {b"concurrent-usd"}
 
 
 def test_cache_version_change_has_distinct_identity() -> None:

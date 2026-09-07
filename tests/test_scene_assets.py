@@ -88,7 +88,9 @@ def test_graph_layout_is_contiguous_and_readonly() -> None:
 
 def test_graph_round_trip_and_hash_mismatch_fail_closed() -> None:
     graph = _graph()
-    assert graph_from_dict(graph_to_dict(graph)).manifest_hash == graph.manifest_hash
+    payload = graph_to_dict(graph)
+    assert payload["entities"][0]["variants"][0]["importer"]["name"] == "test"
+    assert graph_from_dict(payload).manifest_hash == graph.manifest_hash
     layout = derive_state_layout(graph)
     assert state_layout_from_dict(state_layout_to_dict(layout)).layout_hash == layout.layout_hash
     tampered = graph_to_dict(graph)

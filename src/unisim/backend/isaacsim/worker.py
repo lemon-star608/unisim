@@ -19,6 +19,7 @@ import importlib.util
 import json
 import math
 import os
+import pathlib
 import sys
 import time
 from typing import Any
@@ -73,6 +74,15 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _resolve_graph_cache_root(value: Any) -> str:
+    """Resolve the sole scene-v2 cache root on the worker cold path."""
+    if value is None:
+        return str(pathlib.Path("~/.cache/unisim").expanduser().resolve())
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise ValueError("scene-v2 INIT cache_root must be absolute or null")
+    return value
 
 
 def _canonical_graph_hash(graph: dict[str, Any]) -> str:
@@ -171,6 +181,7 @@ class _WorkerContext:
         self.graph_layout: dict[str, Any] | None = None
         self.graph_entities: dict[str, Any] = {}
         self.graph_root_segments: dict[str, tuple[list[int], list[int]]] = {}
+        self.graph_body_native_indices: dict[str, list[int]] = {}
         self.cache_hits: dict[str, list[bool]] = {}
 
     # ------------------------------------------------------------------
@@ -226,7 +237,6 @@ class _WorkerContext:
         ).app
 
         import importlib.metadata
-        import pathlib
         import shutil
 
         import isaaclab.sim as sim_utils  # type: ignore[import-not-found]
@@ -250,14 +260,22 @@ class _WorkerContext:
         from isaacsim.core.cloner import GridCloner  # type: ignore[import-not-found]
 
         self.torch = torch
-        cache_root = payload.get("cache_root")
-        if not isinstance(cache_root, str) or not os.path.isabs(cache_root):
-            raise ValueError("scene-v2 INIT requires one absolute cache_root")
+        cache_root = _resolve_graph_cache_root(payload.get("cache_root"))
         os.makedirs(cache_root, exist_ok=True)
         runtime_versions = {
             "isaacsim": importlib.metadata.version("isaacsim"),
             "isaaclab": importlib.metadata.version("isaaclab"),
         }
+        assets_spec = importlib.util.spec_from_file_location(
+            "unisim_isaacsim_assets", os.path.join(os.path.dirname(__file__), "assets.py")
+        )
+        if assets_spec is None or assets_spec.loader is None:
+            raise RuntimeError("cannot load UniSim IsaacSim cache helper")
+        assets_module = importlib.util.module_from_spec(assets_spec)
+        sys.modules[assets_spec.name] = assets_module
+        assets_spec.loader.exec_module(assets_module)
+        asset_cache_key_type = assets_module.AssetCacheKey
+        materialize_cached_asset = assets_module.materialize_cached_asset
 
         def cached_usd(entity: dict[str, Any], variant: dict[str, Any]) -> tuple[str, bool]:
             source = variant["source"]
@@ -273,40 +291,31 @@ class _WorkerContext:
                     f"entity {entity['name']!r} variant {variant['variant_id']!r} source "
                     f"hash mismatch: expected {source['sha256']}, got {actual_hash}"
                 )
-            key_payload = {
-                "manifest_hash": graph["manifest_hash"],
-                "source_revision": source.get("source_revision"),
-                "source_sha256": source["sha256"],
-                "format": source["format"],
-                "importer": variant["importer"],
-                "role_metadata_hash": variant["role_metadata_hash"],
-                "scale": variant["scale"],
-                "isaacsim": runtime_versions["isaacsim"],
-                "isaaclab": runtime_versions["isaaclab"],
-                "physx_profile": "scene-v2-replicate-physics-false-v1",
-            }
-            digest = hashlib.sha256(
-                json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            entry = pathlib.Path(cache_root) / digest
-            usd_path = entry / "asset.usd"
-            manifest_path = entry / "manifest.json"
-            if entry.is_dir() and usd_path.is_file() and manifest_path.is_file():
-                try:
-                    cached = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    if cached.get("cache_key") == digest and cached.get(
-                        "artifact_sha256"
-                    ) == _sha256_file(str(usd_path)):
-                        return str(usd_path), True
-                except (OSError, ValueError, TypeError):
-                    pass
-                shutil.rmtree(entry)
-            temp = pathlib.Path(
-                __import__("tempfile").mkdtemp(prefix=f".{digest}.tmp-", dir=cache_root)
+            importer = variant["importer"]
+            options = importer.get("options", {})
+            key = asset_cache_key_type(
+                manifest_hash=graph["manifest_hash"],
+                source_revision=source.get("source_revision"),
+                source_sha256=source["sha256"],
+                generator_version="unisim-scene-v2-1",
+                isaacsim_version=runtime_versions["isaacsim"],
+                isaaclab_version=runtime_versions["isaaclab"],
+                importer_profile=str(importer["name"]),
+                importer_options=tuple(
+                    (str(name), json.dumps(value, sort_keys=True, separators=(",", ":")))
+                    for name, value in sorted(options.items())
+                ),
+                physx_profile="scene-v2-replicate-physics-false-v1",
+                entity_kind=str(entity["kind"]),
+                fixed_base=bool(entity["fixed_base"]),
+                visual_only=bool(entity["visual_only"]),
+                collision_enabled=bool(entity["collision_enabled"]),
+                gravity_enabled=bool(entity["gravity_enabled"]),
+                scale=tuple(float(value) for value in variant["scale"]),
             )
-            try:
+
+            def convert(temp: pathlib.Path) -> pathlib.Path:
                 if source["format"] == "urdf":
-                    options = variant["importer"].get("options", {})
                     drive = None
                     if entity["kind"] == "articulation":
                         drive = UrdfConverterCfg.JointDriveCfg(
@@ -339,25 +348,10 @@ class _WorkerContext:
                     raise NotImplementedError(
                         f"scene-v2 IsaacSim graph does not support {source['format']!r} sources"
                     )
-                artifact_hash = _sha256_file(str(temp / "asset.usd"))
-                (temp / "manifest.json").write_text(
-                    json.dumps(
-                        {
-                            "cache_key": digest,
-                            "key": key_payload,
-                            "artifact_sha256": artifact_hash,
-                        },
-                        sort_keys=True,
-                        indent=2,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
-                os.replace(temp, entry)
-                return str(usd_path), False
-            except Exception:
-                shutil.rmtree(temp, ignore_errors=True)
-                raise
+                return temp / "asset.usd"
+
+            path, hit = materialize_cached_asset(pathlib.Path(cache_root), key, convert)
+            return str(path), hit
 
         variant_usds: dict[str, list[str]] = {}
         for entity in entities:
@@ -493,6 +487,7 @@ class _WorkerContext:
             native = [str(name) for name in obj.body_names]
             bindings = entity["body_bindings"]
             native_ids = {name: index for index, name in enumerate(native)}
+            native_indices: list[int] = []
             for binding in bindings:
                 if binding["source_name"] not in native_ids:
                     raise RuntimeError(
@@ -501,6 +496,8 @@ class _WorkerContext:
                     )
                 public_bodies.append(binding["public_name"])
                 native_bodies.append(binding["source_name"])
+                native_indices.append(native_ids[binding["source_name"]])
+            self.graph_body_native_indices[entity["name"]] = native_indices
         self.contract_body_names = public_bodies
         self.native_body_names = native_bodies
         if self.robot is not None:
@@ -967,12 +964,10 @@ class _WorkerContext:
         assert self.graph is not None
         for entity in self.graph["entities"]:
             obj = self.graph_entities[entity["name"]]
-            native = [str(name) for name in obj.body_names]
             state = _tensor_numpy(obj.data.body_link_state_w).copy()
             state[:, :, :3] -= self.env_origins[:, None, :]
-            by_name = {name: index for index, name in enumerate(native)}
-            for binding in entity["body_bindings"]:
-                rows.append(state[:, by_name[binding["source_name"]], :])
+            for native_index in self.graph_body_native_indices[entity["name"]]:
+                rows.append(state[:, native_index, :])
         return rows
 
     def _refresh_graph_state_slots(self) -> None:

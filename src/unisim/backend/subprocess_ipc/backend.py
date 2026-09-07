@@ -295,6 +295,10 @@ class MjcfSubprocessBackend(SimBackend):
             )
         self._graph_mode = isinstance(scene, GraphSceneCfg)
         self._graph_layout: StateLayout | None = None
+        self._graph_body_id_by_name: dict[str, int] = {}
+        self._graph_dof_id_by_name: dict[str, int] = {}
+        self._graph_joint_qpos_by_name: dict[str, int] = {}
+        self._graph_joint_qvel_by_name: dict[str, int] = {}
         if self._graph_mode:
             if int(scene.graph.num_envs) != int(num_envs):
                 raise ValueError(
@@ -302,6 +306,30 @@ class MjcfSubprocessBackend(SimBackend):
                     f"num_envs={num_envs}"
                 )
             self._graph_layout = derive_state_layout(scene.graph)
+            self._graph_body_id_by_name = {
+                name: index for index, name in enumerate(self._graph_layout.public_body_names)
+            }
+            self._graph_dof_id_by_name = {
+                name: index for index, name in enumerate(self._graph_layout.public_joint_names)
+            }
+            qpos_indices = [
+                index
+                for segment in self._graph_layout.segments
+                if segment.component == "joints"
+                for index in range(segment.qpos_start, segment.qpos_start + segment.qpos_width)
+            ]
+            qvel_indices = [
+                index
+                for segment in self._graph_layout.segments
+                if segment.component == "joints"
+                for index in range(segment.qvel_start, segment.qvel_start + segment.qvel_width)
+            ]
+            self._graph_joint_qpos_by_name = dict(
+                zip(self._graph_layout.public_joint_names, qpos_indices)
+            )
+            self._graph_joint_qvel_by_name = dict(
+                zip(self._graph_layout.public_joint_names, qvel_indices)
+            )
         if not self._graph_mode and scene.fragment_files:
             raise NotImplementedError(
                 f"{self._BACKEND_LABEL} backend does not compose MuJoCo scene fragments; provide a "
@@ -958,7 +986,7 @@ class MjcfSubprocessBackend(SimBackend):
     def _body_name_map(self) -> dict[str, int]:
         """Body name→id map; worker-authoritative post-INIT, XML pre-INIT."""
         if self._graph_mode and self._graph_layout is not None:
-            return {name: i for i, name in enumerate(self._graph_layout.public_body_names)}
+            return self._graph_body_id_by_name
         if self._model_info is not None:
             return self._body_id_by_name
         metadata = self._get_scene_metadata()
@@ -967,7 +995,7 @@ class MjcfSubprocessBackend(SimBackend):
     def _dof_name_map(self) -> dict[str, int]:
         """Joint name→dof map; worker-authoritative post-INIT, XML pre-INIT."""
         if self._graph_mode and self._graph_layout is not None:
-            return {name: i for i, name in enumerate(self._graph_layout.public_joint_names)}
+            return self._graph_dof_id_by_name
         if self._model_info is not None:
             return self._dof_id_by_name
         metadata = self._get_scene_metadata()
@@ -1172,42 +1200,20 @@ class MjcfSubprocessBackend(SimBackend):
 
     def get_joint_state_qpos_indices(self, names: Sequence[str]) -> np.ndarray:
         if self._graph_mode:
-            assert self._graph_layout is not None
-            mapping = {
-                name: idx
-                for name, idx in zip(
-                    self._graph_layout.public_joint_names,
-                    [
-                        i
-                        for s in self._graph_layout.segments
-                        if s.component == "joints"
-                        for i in range(s.qpos_start, s.qpos_start + s.qpos_width)
-                    ],
-                )
-            }
             try:
-                return np.asarray([mapping[str(name)] for name in names], dtype=np.int32)
+                return np.asarray(
+                    [self._graph_joint_qpos_by_name[str(name)] for name in names], dtype=np.int32
+                )
             except KeyError as exc:
                 raise ValueError(f"Joint {exc.args[0]!r} not found in graph scene") from exc
         return self._resolve_dof_ids(names) + _ROOT_QPOS_DIM
 
     def get_joint_state_qvel_indices(self, names: Sequence[str]) -> np.ndarray:
         if self._graph_mode:
-            assert self._graph_layout is not None
-            mapping = {
-                name: idx
-                for name, idx in zip(
-                    self._graph_layout.public_joint_names,
-                    [
-                        i
-                        for s in self._graph_layout.segments
-                        if s.component == "joints"
-                        for i in range(s.qvel_start, s.qvel_start + s.qvel_width)
-                    ],
-                )
-            }
             try:
-                return np.asarray([mapping[str(name)] for name in names], dtype=np.int32)
+                return np.asarray(
+                    [self._graph_joint_qvel_by_name[str(name)] for name in names], dtype=np.int32
+                )
             except KeyError as exc:
                 raise ValueError(f"Joint {exc.args[0]!r} not found in graph scene") from exc
         return self._resolve_dof_ids(names) + _ROOT_QVEL_DIM
