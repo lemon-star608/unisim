@@ -42,6 +42,14 @@ from unisim.dr.types import (
     ResetRandomizationPayload,
 )
 from unisim.scene import SceneCfg
+from unisim.scene_assets import (
+    GraphSceneCfg,
+    StateLayout,
+    derive_state_layout,
+    graph_to_dict,
+    state_layout_from_dict,
+    state_layout_to_dict,
+)
 from unisim.utils.rotation import (
     np_quat_apply_batched,
     np_quat_apply_inverse_batched,
@@ -259,7 +267,7 @@ class MjcfSubprocessBackend(SimBackend):
 
     def __init__(
         self,
-        scene: SceneCfg,
+        scene: SceneCfg | GraphSceneCfg,
         num_envs: int,
         sim_dt: float,
         *,
@@ -285,12 +293,21 @@ class MjcfSubprocessBackend(SimBackend):
                 "worker_command must be a non-empty list of strings or None, "
                 f"got {worker_command!r}"
             )
-        if scene.fragment_files:
+        self._graph_mode = isinstance(scene, GraphSceneCfg)
+        self._graph_layout: StateLayout | None = None
+        if self._graph_mode:
+            if int(scene.graph.num_envs) != int(num_envs):
+                raise ValueError(
+                    f"GraphSceneCfg graph.num_envs={scene.graph.num_envs} does not match "
+                    f"num_envs={num_envs}"
+                )
+            self._graph_layout = derive_state_layout(scene.graph)
+        if not self._graph_mode and scene.fragment_files:
             raise NotImplementedError(
                 f"{self._BACKEND_LABEL} backend does not compose MuJoCo scene fragments; provide a "
                 "self-contained MJCF scene through scene.model_file"
             )
-        if scene.terrain is not None:
+        if not self._graph_mode and scene.terrain is not None:
             raise NotImplementedError(
                 f"{self._BACKEND_LABEL} backend does not support generated terrain scenes yet"
             )
@@ -322,6 +339,8 @@ class MjcfSubprocessBackend(SimBackend):
         # metadata leave the value as ``None``.
         self._worker_env_origins: np.ndarray | None = None
         self._collision_filtering_applied = False
+        self._cache_hits: dict[str, list[bool]] = {}
+        self._runtime_versions: dict[str, str] = {}
         self._scene_metadata: SceneMetadata | None = None
         self._initial_qpos: np.ndarray | None = None
         self._initial_qpos_resolved = False
@@ -361,10 +380,11 @@ class MjcfSubprocessBackend(SimBackend):
             raise self._worker_error(
                 f"{self._BACKEND_LABEL} backend is closed and cannot be materialized again"
             )
-        # Parent-side MJCF metadata (sensors, keyframes, joint document order)
-        # is resolved lazily on first access and reused here so the INIT
-        # payload can carry the keyframe pose.
-        self._resolve_initial_qpos()
+        # Legacy scenes scan MJCF metadata on the host.  Graph scenes carry
+        # their already validated immutable descriptor and never enter the XML
+        # scanner.
+        if not self._graph_mode:
+            self._resolve_initial_qpos()
         runtime: Any = None
         if self._worker_command is None:
             runtime = self._resolve_worker_runtime()
@@ -399,9 +419,25 @@ class MjcfSubprocessBackend(SimBackend):
             ) from exc
 
         try:
-            meta = self._request(
-                protocol.CMD_INIT,
-                {
+            if self._graph_mode:
+                assert isinstance(self._scene, GraphSceneCfg)
+                assert self._graph_layout is not None
+                init_payload = {
+                    "protocol_version": protocol.SCENE_PROTOCOL_VERSION,
+                    "scene_kind": "graph",
+                    "graph": graph_to_dict(self._scene.graph),
+                    "state_layout": state_layout_to_dict(self._graph_layout),
+                    "cache_root": None
+                    if self._scene.cache_root is None
+                    else str(self._scene.cache_root),
+                    "num_envs": self._num_envs,
+                    "sim_dt": self._sim_dt,
+                    "device_id": self._device_id,
+                    **runtime_payload,
+                    **worker_init_payload,
+                }
+            else:
+                init_payload = {
                     "model_file": str(Path(self._scene.model_file).expanduser()),
                     "num_envs": self._num_envs,
                     "sim_dt": self._sim_dt,
@@ -421,9 +457,8 @@ class MjcfSubprocessBackend(SimBackend):
                     ),
                     "mjcf_joint_names": list(self._get_scene_metadata().joint_names),
                     **self._position_actuation_payload(),
-                },
-                expect=protocol.CMD_META,
-            )
+                }
+            meta = self._request(protocol.CMD_INIT, init_payload, expect=protocol.CMD_META)
             self._bind_model_metadata(meta)
             self._graphics_enabled = bool(meta.get("graphics_enabled", False))
             self._validate_initial_keyframe()
@@ -431,7 +466,7 @@ class MjcfSubprocessBackend(SimBackend):
             self._request(
                 protocol.CMD_ATTACH, {"slots": self._slot_specs()}, expect=protocol.CMD_READY
             )
-            self._sensor_map = self._resolve_sensor_map()
+            self._sensor_map = {} if self._graph_mode else self._resolve_sensor_map()
             if self._base_name is not None:
                 try:
                     self._base_body_id = self._body_id_by_name[self._base_name]
@@ -453,6 +488,8 @@ class MjcfSubprocessBackend(SimBackend):
         the MuJoCo backend where the model (and thus keyframes) is available
         right after construction.  ``materialize()`` reuses this cache.
         """
+        if self._graph_mode:
+            raise TypeError("MJCF scene metadata is unavailable for GraphSceneCfg")
         if self._scene_metadata is None:
             self._scene_metadata = scan_scene_metadata(
                 str(Path(self._scene.model_file).expanduser()),
@@ -512,6 +549,9 @@ class MjcfSubprocessBackend(SimBackend):
             )
 
     def _bind_model_metadata(self, meta: dict[str, Any]) -> None:
+        if self._graph_mode:
+            self._bind_graph_model_metadata(meta)
+            return
         num_dof = int(meta["num_dof"])
         num_bodies = int(meta["num_bodies"])
         dof_names = tuple(str(name) for name in meta["dof_names"])
@@ -549,6 +589,88 @@ class MjcfSubprocessBackend(SimBackend):
         self._body_id_by_name = {name: index for index, name in enumerate(body_names)}
         self._dof_id_by_name = {name: index for index, name in enumerate(dof_names)}
         self._validate_xml_metadata_against_worker()
+
+    def _bind_graph_model_metadata(self, meta: dict[str, Any]) -> None:
+        """Validate scene-v2 META before allocating any graph slots."""
+        assert self._graph_layout is not None
+        if meta.get("protocol_version") != protocol.SCENE_PROTOCOL_VERSION:
+            raise self._worker_error(
+                "isaacsim graph worker protocol mismatch: "
+                f"worker={meta.get('protocol_version')!r}, "
+                f"expected={protocol.SCENE_PROTOCOL_VERSION!r}"
+            )
+        assert isinstance(self._scene, GraphSceneCfg)
+        graph_hash = self._scene.graph.manifest_hash
+        if meta.get("graph_hash") != graph_hash:
+            raise self._worker_error(
+                f"scene-v2 graph hash mismatch: worker={meta.get('graph_hash')!r}, "
+                f"host={graph_hash!r}"
+            )
+        worker_layout_raw = meta.get("state_layout")
+        if not isinstance(worker_layout_raw, dict):
+            raise self._worker_error("scene-v2 META is missing state_layout")
+        try:
+            worker_layout = state_layout_from_dict(worker_layout_raw)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise self._worker_error(f"invalid scene-v2 worker state_layout META: {exc}") from exc
+        if worker_layout.layout_hash != self._graph_layout.layout_hash:
+            raise self._worker_error(
+                "scene-v2 state layout hash mismatch: "
+                f"worker={worker_layout.layout_hash}, host={self._graph_layout.layout_hash}"
+            )
+        if tuple(worker_layout.public_joint_names) != tuple(
+            self._graph_layout.public_joint_names
+        ) or tuple(worker_layout.public_body_names) != tuple(self._graph_layout.public_body_names):
+            raise self._worker_error("scene-v2 worker public joint/body names do not match graph")
+        for field, size in (
+            ("native_joint_for_public", len(self._graph_layout.public_joint_names)),
+            ("native_body_for_public", len(self._graph_layout.public_body_names)),
+        ):
+            permutation = np.asarray(meta.get(field, np.arange(size)), dtype=np.int64)
+            if (
+                permutation.shape != (size,)
+                or np.any(permutation < 0)
+                or np.unique(permutation).size != size
+            ):
+                raise self._worker_error(f"scene-v2 META {field} is not a valid permutation")
+            native_names = meta.get(field.replace("_for_public", "_names"))
+            if native_names is not None and len(native_names) != size:
+                raise self._worker_error(
+                    f"scene-v2 META {field.replace('_for_public', '_names')} length mismatch"
+                )
+        num_dof = len(self._graph_layout.public_joint_names)
+        num_bodies = len(self._graph_layout.public_body_names)
+        self._model_info = self._MODEL_INFO_CLS(
+            num_dof=num_dof,
+            num_bodies=num_bodies,
+            dof_names=tuple(self._graph_layout.public_joint_names),
+            body_names=tuple(self._graph_layout.public_body_names),
+            gravity=tuple(float(x) for x in meta.get("gravity", (0.0, 0.0, -9.81))),
+            use_gpu_pipeline=bool(meta.get("use_gpu_pipeline", False)),
+        )
+        self._body_id_by_name = {
+            name: index for index, name in enumerate(self._graph_layout.public_body_names)
+        }
+        self._dof_id_by_name = {
+            name: index for index, name in enumerate(self._graph_layout.public_joint_names)
+        }
+        origins = meta.get("env_origins")
+        if origins is not None:
+            values = np.asarray(origins, dtype=np.float32)
+            if values.shape != (self._num_envs, 3) or not np.isfinite(values).all():
+                raise self._worker_error("scene-v2 worker env_origins have invalid shape or values")
+            self._worker_env_origins = values.copy()
+        self._collision_filtering_applied = bool(meta.get("collision_filtering_applied", False))
+        raw_hits = meta.get("cache_hits", {})
+        if isinstance(raw_hits, dict):
+            self._cache_hits = {
+                str(name): [bool(value) for value in values]
+                for name, values in raw_hits.items()
+                if isinstance(values, (list, tuple))
+            }
+        raw_versions = meta.get("runtime_versions", {})
+        if isinstance(raw_versions, dict):
+            self._runtime_versions = {str(key): str(value) for key, value in raw_versions.items()}
 
     def _position_actuation_payload(self) -> dict[str, list[float]]:
         """Per-dof PD/limit/dynamics arrays in MJCF joint document order.
@@ -610,16 +732,32 @@ class MjcfSubprocessBackend(SimBackend):
 
     def _allocate_slots(self) -> None:
         assert self._model_info is not None
-        shapes = protocol.slot_shapes(
-            self._num_envs, self._model_info.num_dof, self._model_info.num_bodies
-        )
-        for name in protocol.SLOT_NAMES:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            names = protocol.GRAPH_SLOT_NAMES
+            shapes = protocol.slot_shapes(
+                self._num_envs,
+                self._model_info.num_dof,
+                self._model_info.num_bodies,
+                qpos_width=self._graph_layout.qpos_width,
+                qvel_width=self._graph_layout.qvel_width,
+                graph=True,
+            )
+        else:
+            names = protocol.SLOT_NAMES
+            shapes = protocol.slot_shapes(
+                self._num_envs, self._model_info.num_dof, self._model_info.num_bodies
+            )
+        for name in names:
             shape = shapes[name]
             handle = shared_memory.SharedMemory(create=True, size=protocol.slot_nbytes(name, shape))
             self._shm_handles[name] = handle
             self._slots[name] = np.ndarray(
                 shape, dtype=protocol.slot_dtype(name), buffer=handle.buf
             )
+            self._slots[name].fill(0)
+        if self._graph_mode:
+            self._slots["wrench_body_ids"].fill(-1)
 
     def _slot_specs(self) -> dict[str, dict[str, Any]]:
         return {
@@ -811,12 +949,16 @@ class MjcfSubprocessBackend(SimBackend):
 
     def _num_dof(self) -> int:
         """DoF count from the worker handshake, falling back to the XML scan."""
+        if self._graph_mode and self._graph_layout is not None:
+            return len(self._graph_layout.public_joint_names)
         if self._model_info is not None:
             return self._model_info.num_dof
         return len(self._get_scene_metadata().joint_names)
 
     def _body_name_map(self) -> dict[str, int]:
         """Body name→id map; worker-authoritative post-INIT, XML pre-INIT."""
+        if self._graph_mode and self._graph_layout is not None:
+            return {name: i for i, name in enumerate(self._graph_layout.public_body_names)}
         if self._model_info is not None:
             return self._body_id_by_name
         metadata = self._get_scene_metadata()
@@ -824,6 +966,8 @@ class MjcfSubprocessBackend(SimBackend):
 
     def _dof_name_map(self) -> dict[str, int]:
         """Joint name→dof map; worker-authoritative post-INIT, XML pre-INIT."""
+        if self._graph_mode and self._graph_layout is not None:
+            return {name: i for i, name in enumerate(self._graph_layout.public_joint_names)}
         if self._model_info is not None:
             return self._dof_id_by_name
         metadata = self._get_scene_metadata()
@@ -844,6 +988,8 @@ class MjcfSubprocessBackend(SimBackend):
         report ``(0, 0)``, matching the MuJoCo backend which returns the raw
         ``actuator_ctrlrange`` (``ctrllimited=false`` → ``0 0``).
         """
+        if self._graph_mode:
+            return np.zeros((self._num_dof(), 2), dtype=np.float32)
         metadata = self._get_scene_metadata()
         by_joint = {spec.joint_name: spec for spec in metadata.actuators}
         rows = [
@@ -855,6 +1001,8 @@ class MjcfSubprocessBackend(SimBackend):
         return np.asarray(rows, dtype=np.float32).reshape(-1, 2)
 
     def get_actuator_names(self) -> tuple[str, ...]:
+        if self._graph_mode and self._graph_layout is not None:
+            return tuple(self._graph_layout.public_joint_names)
         if self._model_info is not None:
             return self._model_info.dof_names
         return self._get_scene_metadata().joint_names
@@ -870,6 +1018,9 @@ class MjcfSubprocessBackend(SimBackend):
         joint document order, which the INIT handshake pins to the worker's
         dof order.
         """
+        if self._graph_mode:
+            zeros = np.zeros((self._num_dof(),), dtype=np.float64)
+            return zeros.copy(), zeros
         metadata = self._get_scene_metadata()
         by_joint = {spec.joint_name: spec for spec in metadata.actuators}
         kp = np.asarray(
@@ -889,7 +1040,7 @@ class MjcfSubprocessBackend(SimBackend):
         return kp, kd
 
     def get_scene_model_file(self) -> str | None:
-        return str(self._scene.model_file)
+        return None if self._graph_mode else str(self._scene.model_file)
 
     def get_keyframe_qpos(self, name: str) -> np.ndarray:
         # Pure parent-side XML metadata: available before materialize(),
@@ -914,6 +1065,9 @@ class MjcfSubprocessBackend(SimBackend):
         return qpos.copy()
 
     def get_default_qpos(self) -> np.ndarray:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            return self._graph_layout.default_qpos.copy()
         initial_qpos = self._resolve_initial_qpos()
         if initial_qpos is not None:
             # The selected scene keyframe is the backend default state (and the
@@ -924,15 +1078,35 @@ class MjcfSubprocessBackend(SimBackend):
         return qpos
 
     def get_default_dof_pos(self) -> np.ndarray:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            indices = [
+                index
+                for segment in self._graph_layout.segments
+                if segment.component == "joints"
+                for index in range(segment.qpos_start, segment.qpos_start + segment.qpos_width)
+            ]
+            return self._graph_layout.default_qpos[np.asarray(indices, dtype=np.intp)].copy()
         initial_qpos = self._resolve_initial_qpos()
         if initial_qpos is not None:
             return initial_qpos[_ROOT_QPOS_DIM:].copy()
         return np.zeros((self._num_dof(),), dtype=np.float32)
 
     def get_init_qvel(self) -> np.ndarray:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            return self._graph_layout.default_qvel.copy()
         return np.zeros((_ROOT_QVEL_DIM + self._num_dof(),), dtype=np.float32)
 
     def get_root_state_layout(self, root_body_name: str) -> BackendRootStateLayout:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            for entity in self._graph_layout.entities:
+                if entity.root is not None and root_body_name in entity.body_public_names:
+                    return entity.root
+            raise NotImplementedError(
+                f"backend '{self._BACKEND_LABEL}' graph has no floating root {root_body_name!r}"
+            )
         if self._model_info is not None:
             root_name = self._model_info.body_names[0]
         else:
@@ -973,6 +1147,8 @@ class MjcfSubprocessBackend(SimBackend):
         The XML is the cross-runtime source of truth for this contract.
         Joints without a ``range`` attribute report ``(-inf, inf)``.
         """
+        if self._graph_mode:
+            return None
         metadata = self._get_scene_metadata()
         if not metadata.joint_ranges:
             return None
@@ -984,6 +1160,8 @@ class MjcfSubprocessBackend(SimBackend):
 
     def get_joint_dof_indices(self, names: Sequence[str]) -> np.ndarray:
         """Resolve named joints to absolute qvel indices (root 6 columns first)."""
+        if self._graph_mode:
+            return self._resolve_dof_ids(names)
         return self._resolve_dof_ids(names) + _ROOT_QVEL_DIM
 
     def get_joint_dof_pos_indices(self, names: Sequence[str]) -> np.ndarray:
@@ -993,9 +1171,45 @@ class MjcfSubprocessBackend(SimBackend):
         return self._resolve_dof_ids(names)
 
     def get_joint_state_qpos_indices(self, names: Sequence[str]) -> np.ndarray:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            mapping = {
+                name: idx
+                for name, idx in zip(
+                    self._graph_layout.public_joint_names,
+                    [
+                        i
+                        for s in self._graph_layout.segments
+                        if s.component == "joints"
+                        for i in range(s.qpos_start, s.qpos_start + s.qpos_width)
+                    ],
+                )
+            }
+            try:
+                return np.asarray([mapping[str(name)] for name in names], dtype=np.int32)
+            except KeyError as exc:
+                raise ValueError(f"Joint {exc.args[0]!r} not found in graph scene") from exc
         return self._resolve_dof_ids(names) + _ROOT_QPOS_DIM
 
     def get_joint_state_qvel_indices(self, names: Sequence[str]) -> np.ndarray:
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            mapping = {
+                name: idx
+                for name, idx in zip(
+                    self._graph_layout.public_joint_names,
+                    [
+                        i
+                        for s in self._graph_layout.segments
+                        if s.component == "joints"
+                        for i in range(s.qvel_start, s.qvel_start + s.qvel_width)
+                    ],
+                )
+            }
+            try:
+                return np.asarray([mapping[str(name)] for name in names], dtype=np.int32)
+            except KeyError as exc:
+                raise ValueError(f"Joint {exc.args[0]!r} not found in graph scene") from exc
         return self._resolve_dof_ids(names) + _ROOT_QVEL_DIM
 
     def _resolve_dof_ids(self, names: Sequence[str]) -> np.ndarray:
@@ -1037,10 +1251,36 @@ class MjcfSubprocessBackend(SimBackend):
         payload = self._request(
             protocol.CMD_STEP, {"nsteps": int(nsteps)}, expect=protocol.CMD_READY
         )
+        if self._graph_mode:
+            self._slots["force"].fill(0.0)
+            self._slots["torque"].fill(0.0)
+            self._slots["wrench_body_ids"].fill(-1)
         ipc_ms = (time.perf_counter() - t0) * 1000.0
         timing = dict(payload.get("timing", {})) if isinstance(payload, dict) else {}
         timing["worker_ipc_total_ms"] = ipc_ms
         return {"timing": timing}
+
+    def get_state(self, fields=None):
+        """Return complete graph rows, retaining the legacy root-first view."""
+        if not self._graph_mode:
+            return super().get_state(fields)
+        requested = (
+            ("qpos", "qvel")
+            if fields is None
+            else ((fields,) if isinstance(fields, str) else tuple(fields))
+        )
+        self._require_state("get_state")
+        result: dict[str, np.ndarray] = {}
+        if "qpos" in requested:
+            result["qpos"] = self._slots["qpos"].copy()
+        if "qvel" in requested:
+            result["qvel"] = self._slots["qvel"].copy()
+        if "ctrl" in requested:
+            result["ctrl"] = self._slots["ctrl"].copy()
+        unknown = set(requested) - {"qpos", "qvel", "ctrl"}
+        if unknown:
+            raise KeyError(f"unknown {self.backend_type} state field(s): {sorted(unknown)}")
+        return result
 
     def set_state(
         self,
@@ -1064,8 +1304,12 @@ class MjcfSubprocessBackend(SimBackend):
             raise ValueError(f"env_indices must be in [0, {self._num_envs}), got {rows}")
         if np.unique(rows).size != rows.size:
             raise ValueError("env_indices must not contain duplicate rows")
-        nq = _ROOT_QPOS_DIM + info.num_dof
-        nv = _ROOT_QVEL_DIM + info.num_dof
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            nq, nv = self._graph_layout.qpos_width, self._graph_layout.qvel_width
+        else:
+            nq = _ROOT_QPOS_DIM + info.num_dof
+            nv = _ROOT_QVEL_DIM + info.num_dof
         qpos_array = np.asarray(qpos, dtype=np.float32)
         qvel_array = np.asarray(qvel, dtype=np.float32)
         if qpos_array.shape != (rows.size, nq):
@@ -1104,6 +1348,44 @@ class MjcfSubprocessBackend(SimBackend):
             ipc_ms - timing["set_state_reset_upload_ms"] - timing["set_state_host_cache_refresh_ms"]
         )
         return {"timing": timing}
+
+    def apply_body_force(
+        self,
+        body_ids: np.ndarray,
+        force: np.ndarray,
+        torque: np.ndarray | None = None,
+    ) -> None:
+        """Stage dense graph wrenches for the upcoming worker step."""
+        if not self._graph_mode:
+            raise NotImplementedError(
+                f"{self._BACKEND_LABEL} legacy worker does not expose dense wrench slots"
+            )
+        self._require_state("apply_body_force")
+        info = self._require_materialized()
+        ids = np.asarray(body_ids, dtype=np.intp)
+        if (
+            ids.ndim != 1
+            or np.any(ids < 0)
+            or np.any(ids >= info.num_bodies)
+            or np.unique(ids).size != ids.size
+        ):
+            raise ValueError(f"body_ids must be unique and in [0, {info.num_bodies})")
+        expected = (self._num_envs, ids.size, 3)
+        values = np.asarray(force, dtype=np.float32)
+        if values.shape != expected or not np.isfinite(values).all():
+            raise ValueError(f"force must have finite shape {expected}, got {values.shape}")
+        if torque is None:
+            torque_values = np.zeros(expected, dtype=np.float32)
+        else:
+            torque_values = np.asarray(torque, dtype=np.float32)
+            if torque_values.shape != expected or not np.isfinite(torque_values).all():
+                raise ValueError(
+                    f"torque must have finite shape {expected}, got {torque_values.shape}"
+                )
+        self._slots["wrench_body_ids"][: ids.size] = ids.astype(np.int32)
+        if ids.size:
+            self._slots["force"][:, ids, :] += values
+            self._slots["torque"][:, ids, :] += torque_values
 
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
         """Advertise no DR until per-env model mutation is effect-tested."""
@@ -1308,10 +1590,28 @@ class MjcfSubprocessBackend(SimBackend):
 
     def get_dof_pos(self) -> np.ndarray:
         self._require_state("get_dof_pos")
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            indices = [
+                index
+                for segment in self._graph_layout.segments
+                if segment.component == "joints"
+                for index in range(segment.qpos_start, segment.qpos_start + segment.qpos_width)
+            ]
+            return self._slots["qpos"][:, np.asarray(indices, dtype=np.intp)]
         return self._slots["dof_state"][:, :, 0]
 
     def get_dof_vel(self) -> np.ndarray:
         self._require_state("get_dof_vel")
+        if self._graph_mode:
+            assert self._graph_layout is not None
+            indices = [
+                index
+                for segment in self._graph_layout.segments
+                if segment.component == "joints"
+                for index in range(segment.qvel_start, segment.qvel_start + segment.qvel_width)
+            ]
+            return self._slots["qvel"][:, np.asarray(indices, dtype=np.intp)]
         return self._slots["dof_state"][:, :, 1]
 
     def _selected_body_state(self, body_ids: np.ndarray) -> np.ndarray:

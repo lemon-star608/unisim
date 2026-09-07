@@ -29,6 +29,10 @@ CMD_READY = "READY"
 CMD_META = "META"
 CMD_ERROR = "ERROR"
 
+# Additive graph protocol.  Legacy ``INIT`` and its slots remain unchanged;
+# graph scenes explicitly negotiate this version before any slots are attached.
+SCENE_PROTOCOL_VERSION = "scene-v2"
+
 _PICKLE_PROTOCOL = 4
 _HEADER = struct.Struct("<Q")
 HEADER_SIZE = _HEADER.size
@@ -91,15 +95,52 @@ _SLOT_DTYPES: Dict[str, str] = {
     "reset_qvel": "float32",
 }
 
+_GRAPH_SLOT_DTYPES: Dict[str, str] = {
+    "qpos": "float32",
+    "qvel": "float32",
+    "ctrl": "float32",
+    "body_state": "float32",
+    "force": "float32",
+    "torque": "float32",
+    "wrench_body_ids": "int32",
+    "reset_env_ids": "int32",
+    "reset_qpos": "float32",
+    "reset_qvel": "float32",
+}
+
 SLOT_NAMES = tuple(_SLOT_DTYPES)
+GRAPH_SLOT_NAMES = tuple(_GRAPH_SLOT_DTYPES)
 
 
-def slot_shapes(num_envs: int, num_dof: int, num_bodies: int) -> Dict[str, Tuple[int, ...]]:
+def slot_shapes(
+    num_envs: int,
+    num_dof: int,
+    num_bodies: int,
+    *,
+    qpos_width: int | None = None,
+    qvel_width: int | None = None,
+    graph: bool = False,
+) -> Dict[str, Tuple[int, ...]]:
     if num_envs <= 0 or num_dof < 0 or num_bodies <= 0:
         raise ValueError(
             "slot shapes require num_envs>0, num_dof>=0, num_bodies>0; "
             f"got {num_envs}, {num_dof}, {num_bodies}"
         )
+    if graph:
+        if qpos_width is None or qvel_width is None or qpos_width <= 0 or qvel_width <= 0:
+            raise ValueError("graph slot shapes require positive qpos_width and qvel_width")
+        return {
+            "qpos": (num_envs, int(qpos_width)),
+            "qvel": (num_envs, int(qvel_width)),
+            "ctrl": (num_envs, num_dof),
+            "body_state": (num_envs, num_bodies, 13),
+            "force": (num_envs, num_bodies, 3),
+            "torque": (num_envs, num_bodies, 3),
+            "wrench_body_ids": (num_bodies,),
+            "reset_env_ids": (num_envs,),
+            "reset_qpos": (num_envs, int(qpos_width)),
+            "reset_qvel": (num_envs, int(qvel_width)),
+        }
     return {
         "ctrl": (num_envs, num_dof),
         "root_state": (num_envs, 13),
@@ -114,9 +155,30 @@ def slot_shapes(num_envs: int, num_dof: int, num_bodies: int) -> Dict[str, Tuple
 
 def slot_dtype(name: str) -> np.dtype:
     try:
-        return np.dtype(_SLOT_DTYPES[name])
+        return np.dtype({**_SLOT_DTYPES, **_GRAPH_SLOT_DTYPES}[name])
     except KeyError as exc:
-        raise ValueError(f"unknown shm slot {name!r}; known: {sorted(_SLOT_DTYPES)}") from exc
+        raise ValueError(
+            f"unknown shm slot {name!r}; known: {sorted({**_SLOT_DTYPES, **_GRAPH_SLOT_DTYPES})}"
+        ) from exc
+
+
+def validate_slot_spec(name: str, spec: Dict[str, Any], expected_shape: Tuple[int, ...]) -> None:
+    """Validate one fixed-capacity shared-memory slot before attachment."""
+    if not isinstance(spec, dict):
+        raise ValueError(f"slot {name!r} specification must be a mapping")
+    raw_shape = tuple(spec.get("shape", ()))
+    if raw_shape != tuple(expected_shape):
+        raise ValueError(
+            f"slot {name!r} shape mismatch: got {raw_shape}, expected {expected_shape}"
+        )
+    expected_dtype = str(slot_dtype(name))
+    if str(spec.get("dtype")) != expected_dtype:
+        raise ValueError(
+            f"slot {name!r} dtype mismatch: got {spec.get('dtype')!r}, expected {expected_dtype!r}"
+        )
+    shm_name = spec.get("shm")
+    if not isinstance(shm_name, str) or not shm_name:
+        raise ValueError(f"slot {name!r} is missing a shared-memory name")
 
 
 def slot_nbytes(name: str, shape: Tuple[int, ...]) -> int:
@@ -177,8 +239,10 @@ __all__ = [
     "CMD_SET_STATE",
     "CMD_SHUTDOWN",
     "CMD_STEP",
+    "GRAPH_SLOT_NAMES",
     "HEADER_SIZE",
     "SLOT_NAMES",
+    "SCENE_PROTOCOL_VERSION",
     "WorkerDisconnectedError",
     "decode_message",
     "format_worker_error",
@@ -191,6 +255,7 @@ __all__ = [
     "slot_dtype",
     "slot_nbytes",
     "slot_shapes",
+    "validate_slot_spec",
     "unpack_header",
     "wxyz_to_xyzw",
     "xyzw_to_wxyz",
