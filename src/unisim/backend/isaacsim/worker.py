@@ -14,7 +14,9 @@ worker can remain on the inexpensive no-rendering experience.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
+import json
 import math
 import os
 import sys
@@ -57,6 +59,30 @@ def _quat_rotate_wxyz(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
     uv = np.cross(u, v)
     uuv = np.cross(u, uv)
     return (v + 2.0 * (w * uv + uuv)).astype(np.float32)
+
+
+def _quat_rotate_inverse_wxyz(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    inverse = np.asarray(quat, dtype=np.float64).copy()
+    inverse[..., 1:4] *= -1.0
+    return _quat_rotate_wxyz(inverse, vec)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_graph_hash(graph: dict[str, Any]) -> str:
+    content = {
+        "schema_version": graph["schema_version"],
+        "num_envs": graph["num_envs"],
+        "entities": graph["entities"],
+    }
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _resolve_articulation_root_prim_path(usd_path: str, root_name: str) -> str:
@@ -140,12 +166,397 @@ class _WorkerContext:
         self.collision_filtering_applied = False
         self.slots: dict[str, np.ndarray] = {}
         self._shm_handles: list[Any] = []
+        self.graph_mode = False
+        self.graph: dict[str, Any] | None = None
+        self.graph_layout: dict[str, Any] | None = None
+        self.graph_entities: dict[str, Any] = {}
+        self.graph_root_segments: dict[str, tuple[list[int], list[int]]] = {}
+        self.cache_hits: dict[str, list[bool]] = {}
 
     # ------------------------------------------------------------------
     # Cold-path materialization
     # ------------------------------------------------------------------
 
+    def _init_graph_sim(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Materialize a validated scene-v2 graph into private IsaacLab assets."""
+        if payload.get("protocol_version") != self.protocol.SCENE_PROTOCOL_VERSION:
+            raise ValueError(
+                "isaacsim graph worker supports only protocol "
+                f"{self.protocol.SCENE_PROTOCOL_VERSION!r}"
+            )
+        graph = payload.get("graph")
+        layout = payload.get("state_layout")
+        if not isinstance(graph, dict) or not isinstance(layout, dict):
+            raise TypeError("scene-v2 INIT requires graph and state_layout mappings")
+        if graph.get("manifest_hash") != _canonical_graph_hash(graph):
+            raise ValueError("scene-v2 graph manifest hash does not match canonical content")
+        if int(graph.get("num_envs", 0)) != int(payload.get("num_envs", 0)):
+            raise ValueError("scene-v2 graph num_envs does not match INIT num_envs")
+        entities = graph.get("entities")
+        if not isinstance(entities, list) or not entities:
+            raise ValueError("scene-v2 graph must contain entities")
+
+        os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "1")
+        self.graph_mode = True
+        self.graph = graph
+        self.graph_layout = layout
+        self.num_envs = int(payload["num_envs"])
+        self.sim_dt = float(payload["sim_dt"])
+        device_id = int(payload.get("device_id", 0))
+        if device_id < 0:
+            raise NotImplementedError("isaacsim graph runtime requires a CUDA device")
+        self.device = f"cuda:{device_id}"
+        self.render_mode = str(payload.get("render_mode", "none"))
+        self.render_width = int(payload.get("render_width", 1280))
+        self.render_height = int(payload.get("render_height", 720))
+        os.environ["HEADLESS"] = "0" if self.render_mode == "interactive" else "1"
+        os.environ["ENABLE_CAMERAS"] = "1" if self.render_mode == "record" else "0"
+        os.environ["LIVESTREAM"] = "0"
+        os.environ["XR"] = "0"
+
+        from isaaclab.app import AppLauncher  # type: ignore[import-not-found]
+
+        self.simulation_app = AppLauncher(
+            {
+                "headless": self.render_mode != "interactive",
+                "enable_cameras": self.render_mode == "record",
+                "device": self.device,
+                "multi_gpu": False,
+            }
+        ).app
+
+        import importlib.metadata
+        import pathlib
+        import shutil
+
+        import isaaclab.sim as sim_utils  # type: ignore[import-not-found]
+        import isaacsim.core.utils.prims as prim_utils  # type: ignore[import-not-found]
+        import torch  # type: ignore[import-not-found]
+        from isaaclab.actuators import ImplicitActuatorCfg  # type: ignore[import-not-found]
+        from isaaclab.assets import (  # type: ignore[import-not-found]
+            Articulation,
+            ArticulationCfg,
+            RigidObject,
+            RigidObjectCfg,
+        )
+        from isaaclab.sim.converters import (  # type: ignore[import-not-found]
+            UrdfConverter,
+            UrdfConverterCfg,
+        )
+        from isaaclab.sim.spawners.from_files import UsdFileCfg  # type: ignore[import-not-found]
+        from isaaclab.sim.spawners.wrappers import (  # type: ignore[import-not-found]
+            MultiAssetSpawnerCfg,
+        )
+        from isaacsim.core.cloner import GridCloner  # type: ignore[import-not-found]
+
+        self.torch = torch
+        cache_root = payload.get("cache_root")
+        if not isinstance(cache_root, str) or not os.path.isabs(cache_root):
+            raise ValueError("scene-v2 INIT requires one absolute cache_root")
+        os.makedirs(cache_root, exist_ok=True)
+        runtime_versions = {
+            "isaacsim": importlib.metadata.version("isaacsim"),
+            "isaaclab": importlib.metadata.version("isaaclab"),
+        }
+
+        def cached_usd(entity: dict[str, Any], variant: dict[str, Any]) -> tuple[str, bool]:
+            source = variant["source"]
+            source_path = os.path.abspath(os.path.expanduser(source["uri"]))
+            if not os.path.isfile(source_path):
+                raise FileNotFoundError(
+                    f"entity {entity['name']!r} variant {variant['variant_id']!r} source "
+                    f"does not exist: {source_path}"
+                )
+            actual_hash = _sha256_file(source_path)
+            if actual_hash != source["sha256"]:
+                raise ValueError(
+                    f"entity {entity['name']!r} variant {variant['variant_id']!r} source "
+                    f"hash mismatch: expected {source['sha256']}, got {actual_hash}"
+                )
+            key_payload = {
+                "manifest_hash": graph["manifest_hash"],
+                "source_revision": source.get("source_revision"),
+                "source_sha256": source["sha256"],
+                "format": source["format"],
+                "importer": variant["importer"],
+                "role_metadata_hash": variant["role_metadata_hash"],
+                "scale": variant["scale"],
+                "isaacsim": runtime_versions["isaacsim"],
+                "isaaclab": runtime_versions["isaaclab"],
+                "physx_profile": "scene-v2-replicate-physics-false-v1",
+            }
+            digest = hashlib.sha256(
+                json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            entry = pathlib.Path(cache_root) / digest
+            usd_path = entry / "asset.usd"
+            manifest_path = entry / "manifest.json"
+            if entry.is_dir() and usd_path.is_file() and manifest_path.is_file():
+                try:
+                    cached = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if cached.get("cache_key") == digest and cached.get(
+                        "artifact_sha256"
+                    ) == _sha256_file(str(usd_path)):
+                        return str(usd_path), True
+                except (OSError, ValueError, TypeError):
+                    pass
+                shutil.rmtree(entry)
+            temp = pathlib.Path(
+                __import__("tempfile").mkdtemp(prefix=f".{digest}.tmp-", dir=cache_root)
+            )
+            try:
+                if source["format"] == "urdf":
+                    options = variant["importer"].get("options", {})
+                    drive = None
+                    if entity["kind"] == "articulation":
+                        drive = UrdfConverterCfg.JointDriveCfg(
+                            gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+                                stiffness=float(options.get("stiffness", 100.0)),
+                                damping=float(options.get("damping", 10.0)),
+                            )
+                        )
+                    converter = UrdfConverter(
+                        UrdfConverterCfg(
+                            asset_path=source_path,
+                            usd_dir=str(temp),
+                            usd_file_name="asset.usd",
+                            force_usd_conversion=True,
+                            fix_base=bool(entity["fixed_base"]),
+                            self_collision=bool(options.get("self_collision", False)),
+                            replace_cylinders_with_capsules=bool(
+                                options.get("replace_cylinders_with_capsules", True)
+                            ),
+                            make_instanceable=True,
+                            joint_drive=drive,
+                        )
+                    )
+                    generated = pathlib.Path(converter.usd_path)
+                    if generated.resolve() != (temp / "asset.usd").resolve():
+                        shutil.copy2(generated, temp / "asset.usd")
+                elif source["format"] == "usd":
+                    shutil.copy2(source_path, temp / "asset.usd")
+                else:
+                    raise NotImplementedError(
+                        f"scene-v2 IsaacSim graph does not support {source['format']!r} sources"
+                    )
+                artifact_hash = _sha256_file(str(temp / "asset.usd"))
+                (temp / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "cache_key": digest,
+                            "key": key_payload,
+                            "artifact_sha256": artifact_hash,
+                        },
+                        sort_keys=True,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temp, entry)
+                return str(usd_path), False
+            except Exception:
+                shutil.rmtree(temp, ignore_errors=True)
+                raise
+
+        variant_usds: dict[str, list[str]] = {}
+        for entity in entities:
+            if len(entity.get("env_variant_ids", ())) != self.num_envs:
+                raise ValueError(f"entity {entity.get('name')!r} assignment length mismatch")
+            usds: list[str] = []
+            hits: list[bool] = []
+            for variant in entity["variants"]:
+                path, hit = cached_usd(entity, variant)
+                usds.append(path)
+                hits.append(hit)
+            assignments = np.asarray(entity["env_variant_ids"], dtype=np.int64)
+            if (
+                np.any(assignments < 0)
+                or np.any(assignments >= len(usds))
+                or assignments.shape != (self.num_envs,)
+            ):
+                raise ValueError(f"entity {entity['name']!r} assignment is out of range")
+            variant_usds[entity["name"]] = usds
+            self.cache_hits[entity["name"]] = hits
+
+        self.sim = sim_utils.SimulationContext(
+            sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
+        )
+        cloner = GridCloner(spacing=2.0)
+        cloner.define_base_env("/World/envs")
+        self.env_prim_paths = cloner.generate_paths("/World/envs/env", self.num_envs)
+        prim_utils.create_prim(self.env_prim_paths[0], "Xform")
+        self.env_origins = np.asarray(
+            cloner.clone(
+                source_prim_path=self.env_prim_paths[0],
+                prim_paths=self.env_prim_paths,
+                replicate_physics=False,
+                copy_from_source=True,
+                clone_in_fabric=False,
+            ),
+            dtype=np.float32,
+        )
+
+        for entity in entities:
+            name = entity["name"]
+            role_path = "".join(part.capitalize() for part in name.split("_"))
+            assigned = [variant_usds[name][int(index)] for index in entity["env_variant_ids"]]
+            variants = entity["variants"]
+            asset_cfgs = []
+            for env_index, usd in enumerate(assigned):
+                variant = variants[int(entity["env_variant_ids"][env_index])]
+                asset_cfgs.append(
+                    UsdFileCfg(
+                        usd_path=usd,
+                        scale=tuple(float(x) for x in variant["scale"]),
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                            kinematic_enabled=entity["kind"] in {"kinematic", "visual"},
+                            disable_gravity=not bool(entity["gravity_enabled"]),
+                        ),
+                        collision_props=sim_utils.CollisionPropertiesCfg(
+                            collision_enabled=bool(entity["collision_enabled"])
+                        ),
+                        articulation_props=(
+                            sim_utils.ArticulationRootPropertiesCfg(
+                                fix_root_link=bool(entity["fixed_base"]),
+                                enabled_self_collisions=False,
+                            )
+                            if entity["kind"] == "articulation"
+                            else sim_utils.ArticulationRootPropertiesCfg(articulation_enabled=False)
+                        ),
+                    )
+                )
+            spawn = MultiAssetSpawnerCfg(assets_cfg=asset_cfgs, random_choice=False)
+            qpos = entity.get("default_root_qpos")
+            initial_pos = (0.0, 0.0, 0.0) if qpos is None else tuple(qpos[:3])
+            initial_rot = (1.0, 0.0, 0.0, 0.0) if qpos is None else tuple(qpos[3:7])
+            prim_path = f"/World/envs/env_.*/{role_path}"
+            if entity["kind"] == "articulation":
+                joint_names = [item["public_name"] for item in entity["joint_bindings"]]
+                obj = Articulation(
+                    ArticulationCfg(
+                        prim_path=prim_path,
+                        spawn=spawn,
+                        init_state=ArticulationCfg.InitialStateCfg(
+                            pos=initial_pos,
+                            rot=initial_rot,
+                            joint_pos={
+                                name: float(value)
+                                for name, value in zip(
+                                    [item["source_name"] for item in entity["joint_bindings"]],
+                                    entity["default_joint_qpos"],
+                                )
+                            },
+                        ),
+                        actuators={
+                            "all": ImplicitActuatorCfg(
+                                joint_names_expr=[".*"],
+                                stiffness=float(
+                                    entity["variants"][0]["importer"]["options"].get(
+                                        "stiffness", 100.0
+                                    )
+                                ),
+                                damping=float(
+                                    entity["variants"][0]["importer"]["options"].get(
+                                        "damping", 10.0
+                                    )
+                                ),
+                            )
+                        },
+                    )
+                )
+                self.robot = obj
+                self.contract_joint_names = joint_names
+            else:
+                obj = RigidObject(
+                    RigidObjectCfg(
+                        prim_path=prim_path,
+                        spawn=spawn,
+                        init_state=RigidObjectCfg.InitialStateCfg(pos=initial_pos, rot=initial_rot),
+                    )
+                )
+            self.graph_entities[name] = obj
+
+        if self.num_envs > 1:
+            cloner.filter_collisions(
+                self._graph_physics_scene_path(), "/World/collisions", self.env_prim_paths
+            )
+            self.collision_filtering_applied = True
+        self.sim.reset()
+        for obj in self.graph_entities.values():
+            obj.update(self.sim_dt)
+
+        public_bodies: list[str] = []
+        native_bodies: list[str] = []
+        for entity in entities:
+            obj = self.graph_entities[entity["name"]]
+            native = [str(name) for name in obj.body_names]
+            bindings = entity["body_bindings"]
+            native_ids = {name: index for index, name in enumerate(native)}
+            for binding in bindings:
+                if binding["source_name"] not in native_ids:
+                    raise RuntimeError(
+                        f"entity {entity['name']!r} native body {binding['source_name']!r} "
+                        f"not found in {native}"
+                    )
+                public_bodies.append(binding["public_name"])
+                native_bodies.append(binding["source_name"])
+        self.contract_body_names = public_bodies
+        self.native_body_names = native_bodies
+        if self.robot is not None:
+            self.native_joint_names = [str(name) for name in self.robot.joint_names]
+            source_joint_names = [
+                item["source_name"] for entity in entities for item in entity["joint_bindings"]
+            ]
+            self.native_joint_for_contract = self._build_permutation(
+                self.native_joint_names, source_joint_names, "joint"
+            )
+        self.num_dof = len(self.contract_joint_names)
+        self.num_bodies = len(self.contract_body_names)
+
+        for entity_layout in layout["entities"]:
+            root = entity_layout.get("root")
+            if root is not None:
+                self.graph_root_segments[entity_layout["entity_name"]] = (
+                    list(root["qpos_indices"]),
+                    list(root["qvel_indices"]),
+                )
+        return {
+            "protocol_version": self.protocol.SCENE_PROTOCOL_VERSION,
+            "graph_hash": graph["manifest_hash"],
+            "state_layout": layout,
+            "num_dof": self.num_dof,
+            "num_bodies": self.num_bodies,
+            "dof_names": list(self.contract_joint_names),
+            "body_names": list(self.contract_body_names),
+            "native_joint_for_public": list(range(self.num_dof)),
+            "native_body_for_public": list(range(self.num_bodies)),
+            "gravity": [0.0, 0.0, -9.81],
+            "use_gpu_pipeline": True,
+            "graphics_enabled": self.render_mode != "none",
+            "render_mode": self.render_mode,
+            "render_width": self.render_width,
+            "render_height": self.render_height,
+            "env_origins": self.env_origins.tolist(),
+            "collision_filtering_applied": self.collision_filtering_applied,
+            "replicate_physics": False,
+            "clone_in_fabric": False,
+            "cache_hits": self.cache_hits,
+            "runtime_versions": runtime_versions,
+        }
+
+    def _graph_physics_scene_path(self) -> str:
+        from pxr import PhysxSchema  # type: ignore[import-not-found]
+
+        for obj in self.graph_entities.values():
+            for prim in obj.stage.Traverse():
+                if prim.HasAPI(PhysxSchema.PhysxSceneAPI):
+                    return str(prim.GetPath())
+        raise RuntimeError("IsaacSim graph stage has no PhysxSceneAPI")
+
     def init_sim(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("scene_kind") == "graph":
+            return self._init_graph_sim(payload)
         os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "1")
         self.num_envs = int(payload["num_envs"])
         self.sim_dt = float(payload["sim_dt"])
@@ -510,7 +921,27 @@ class _WorkerContext:
     def attach_slots(self, payload: dict[str, Any]) -> None:
         from multiprocessing import resource_tracker, shared_memory
 
-        for name, spec in payload["slots"].items():
+        supplied = payload["slots"]
+        if self.graph_mode:
+            expected = self.protocol.slot_shapes(
+                self.num_envs,
+                self.num_dof,
+                self.num_bodies,
+                qpos_width=int(self.graph_layout["qpos_width"]),
+                qvel_width=int(self.graph_layout["qvel_width"]),
+                graph=True,
+            )
+            expected_names = set(self.protocol.GRAPH_SLOT_NAMES)
+        else:
+            expected = self.protocol.slot_shapes(self.num_envs, self.num_dof, self.num_bodies)
+            expected_names = set(self.protocol.SLOT_NAMES)
+        if set(supplied) != expected_names:
+            raise ValueError(
+                f"shared-memory slot names mismatch: got {sorted(supplied)}, "
+                f"expected {sorted(expected_names)}"
+            )
+        for name, spec in supplied.items():
+            self.protocol.validate_slot_spec(name, spec, expected[name])
             handle = shared_memory.SharedMemory(name=spec["shm"], create=False)
             # The host owns unlinking; prevent the worker's resource tracker
             # from unlinking the segment when Kit exits.
@@ -520,6 +951,62 @@ class _WorkerContext:
             )
             self._shm_handles.append(handle)
         self.refresh_state_slots()
+
+    def _graph_joint_indices(self) -> tuple[list[int], list[int]]:
+        qpos: list[int] = []
+        qvel: list[int] = []
+        for segment in self.graph_layout["segments"]:
+            if segment["component"] != "joints":
+                continue
+            qpos.extend(range(segment["qpos_start"], segment["qpos_start"] + segment["qpos_width"]))
+            qvel.extend(range(segment["qvel_start"], segment["qvel_start"] + segment["qvel_width"]))
+        return qpos, qvel
+
+    def _graph_body_rows(self) -> list[np.ndarray]:
+        rows: list[np.ndarray] = []
+        assert self.graph is not None
+        for entity in self.graph["entities"]:
+            obj = self.graph_entities[entity["name"]]
+            native = [str(name) for name in obj.body_names]
+            state = _tensor_numpy(obj.data.body_link_state_w).copy()
+            state[:, :, :3] -= self.env_origins[:, None, :]
+            by_name = {name: index for index, name in enumerate(native)}
+            for binding in entity["body_bindings"]:
+                rows.append(state[:, by_name[binding["source_name"]], :])
+        return rows
+
+    def _refresh_graph_state_slots(self) -> None:
+        assert self.graph is not None
+        qpos = np.broadcast_to(
+            np.asarray(self.graph_layout["default_qpos"], dtype=np.float32),
+            (self.num_envs, int(self.graph_layout["qpos_width"])),
+        ).copy()
+        qvel = np.broadcast_to(
+            np.asarray(self.graph_layout["default_qvel"], dtype=np.float32),
+            (self.num_envs, int(self.graph_layout["qvel_width"])),
+        ).copy()
+        qpos_joint_indices, qvel_joint_indices = self._graph_joint_indices()
+        if self.robot is not None and qpos_joint_indices:
+            joint_pos = _tensor_numpy(self.robot.data.joint_pos)
+            joint_vel = _tensor_numpy(self.robot.data.joint_vel)
+            qpos[:, qpos_joint_indices] = joint_pos[:, self.native_joint_for_contract]
+            qvel[:, qvel_joint_indices] = joint_vel[:, self.native_joint_for_contract]
+        for entity in self.graph["entities"]:
+            segment = self.graph_root_segments.get(entity["name"])
+            if segment is None:
+                continue
+            obj = self.graph_entities[entity["name"]]
+            root = _tensor_numpy(obj.data.root_link_state_w).copy()
+            root[:, :3] -= self.env_origins
+            qpos_indices, qvel_indices = segment
+            qpos[:, qpos_indices] = root[:, :7]
+            qvel[:, qvel_indices[:3]] = root[:, 7:10]
+            qvel[:, qvel_indices[3:6]] = _quat_rotate_inverse_wxyz(root[:, 3:7], root[:, 10:13])
+        body_rows = self._graph_body_rows()
+        body = np.stack(body_rows, axis=1)
+        np.copyto(self.slots["qpos"], qpos)
+        np.copyto(self.slots["qvel"], qvel)
+        np.copyto(self.slots["body_state"], body)
 
     def _state_tensors(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         data = self.robot.data
@@ -536,6 +1023,9 @@ class _WorkerContext:
         return root, dof, body
 
     def refresh_state_slots(self) -> None:
+        if self.graph_mode:
+            self._refresh_graph_state_slots()
+            return
         root, dof, body = self._state_tensors()
         # IsaacLab reports world-frame positions.  Remove the private clone
         # translation before publishing UniLab's local-frame state.
@@ -561,17 +1051,30 @@ class _WorkerContext:
         native_target[:, self.native_joint_for_contract] = ctrl
         target = _to_tensor(self.torch, native_target, self.device)
         self.robot.set_joint_position_target(target)
+        if self.graph_mode:
+            self._stage_graph_wrenches()
         nsteps = int(payload["nsteps"])
         if nsteps <= 0:
             raise ValueError(f"nsteps must be positive, got {nsteps}")
         t0 = time.perf_counter()
         for _ in range(nsteps):
-            self.robot.write_data_to_sim()
+            if self.graph_mode:
+                for obj in self.graph_entities.values():
+                    obj.write_data_to_sim()
+            else:
+                self.robot.write_data_to_sim()
             self.sim.step(render=False)
-            self.robot.update(self.sim_dt)
+            if self.graph_mode:
+                for obj in self.graph_entities.values():
+                    obj.update(self.sim_dt)
+            else:
+                self.robot.update(self.sim_dt)
         physics_ms = (time.perf_counter() - t0) * 1000.0
         t0 = time.perf_counter()
         self.refresh_state_slots()
+        if self.graph_mode:
+            for obj in self.graph_entities.values():
+                obj.reset()
         refresh_ms = (time.perf_counter() - t0) * 1000.0
         return {
             "timing": {
@@ -580,6 +1083,27 @@ class _WorkerContext:
                 "state_refresh_ms": refresh_ms,
             }
         }
+
+    def _stage_graph_wrenches(self) -> None:
+        """Map dense public body rows to native assets in world coordinates."""
+        force = np.asarray(self.slots["force"], dtype=np.float32)
+        torque = np.asarray(self.slots["torque"], dtype=np.float32)
+        expected = (self.num_envs, self.num_bodies, 3)
+        if force.shape != expected or torque.shape != expected:
+            raise ValueError(f"dense wrench slots must have shape {expected}")
+        assert self.graph is not None
+        body_cursor = 0
+        for entity in self.graph["entities"]:
+            count = len(entity["body_bindings"])
+            obj = self.graph_entities[entity["name"]]
+            values_f = force[:, body_cursor : body_cursor + count, :]
+            values_t = torque[:, body_cursor : body_cursor + count, :]
+            obj.set_external_force_and_torque(
+                _to_tensor(self.torch, values_f, self.device),
+                _to_tensor(self.torch, values_t, self.device),
+                is_global=True,
+            )
+            body_cursor += count
 
     def set_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         count = int(payload["count"])
@@ -592,6 +1116,8 @@ class _WorkerContext:
             raise ValueError("reset environment ids must not contain duplicates")
         if np.any(env_ids_np < 0) or np.any(env_ids_np >= self.num_envs):
             raise ValueError("reset environment ids are out of range")
+        if self.graph_mode:
+            return self._set_graph_state(env_ids_np, qpos, qvel)
         expected_qpos = (count, 7 + self.num_dof)
         expected_qvel = (count, 6 + self.num_dof)
         if qpos.shape != expected_qpos:
@@ -629,7 +1155,81 @@ class _WorkerContext:
             }
         }
 
+    def _set_graph_state(
+        self, env_ids_np: np.ndarray, qpos: np.ndarray, qvel: np.ndarray
+    ) -> dict[str, Any]:
+        """Write selected complete scene-v2 rows without touching other rows."""
+        count = int(env_ids_np.size)
+        expected_qpos = (count, int(self.graph_layout["qpos_width"]))
+        expected_qvel = (count, int(self.graph_layout["qvel_width"]))
+        if qpos.shape != expected_qpos or qvel.shape != expected_qvel:
+            raise ValueError(
+                f"graph reset rows have shapes {qpos.shape}/{qvel.shape}; "
+                f"expected {expected_qpos}/{expected_qvel}"
+            )
+        env_ids = self.torch.as_tensor(env_ids_np, dtype=self.torch.long, device=self.device)
+        qpos_joint_indices, qvel_joint_indices = self._graph_joint_indices()
+        if self.robot is not None and qpos_joint_indices:
+            native_pos = _tensor_numpy(self.robot.data.joint_pos)[env_ids_np].copy()
+            native_vel = _tensor_numpy(self.robot.data.joint_vel)[env_ids_np].copy()
+            native_pos[:, self.native_joint_for_contract] = qpos[:, qpos_joint_indices]
+            native_vel[:, self.native_joint_for_contract] = qvel[:, qvel_joint_indices]
+            self.robot.write_joint_state_to_sim(
+                _to_tensor(self.torch, native_pos, self.device),
+                _to_tensor(self.torch, native_vel, self.device),
+                env_ids=env_ids,
+            )
+        assert self.graph is not None
+        for entity in self.graph["entities"]:
+            segment = self.graph_root_segments.get(entity["name"])
+            if segment is None:
+                continue
+            obj = self.graph_entities[entity["name"]]
+            qpos_indices, qvel_indices = segment
+            root_pose_np = qpos[:, qpos_indices].copy()
+            root_pose_np[:, :3] += self.env_origins[env_ids_np]
+            root_velocity_np = np.empty((count, 6), dtype=np.float32)
+            root_velocity_np[:, :3] = qvel[:, qvel_indices[:3]]
+            root_velocity_np[:, 3:6] = _quat_rotate_wxyz(
+                root_pose_np[:, 3:7], qvel[:, qvel_indices[3:6]]
+            )
+            obj.write_root_pose_to_sim(
+                _to_tensor(self.torch, root_pose_np, self.device), env_ids=env_ids
+            )
+            obj.write_root_link_velocity_to_sim(
+                _to_tensor(self.torch, root_velocity_np, self.device), env_ids=env_ids
+            )
+        for obj in self.graph_entities.values():
+            obj.reset(env_ids)
+            obj.update(self.sim_dt)
+        t0 = time.perf_counter()
+        self.refresh_state_slots()
+        return {
+            "timing": {
+                "set_state_reset_upload_ms": 0.0,
+                "set_state_host_cache_refresh_ms": (time.perf_counter() - t0) * 1000.0,
+            }
+        }
+
     def get_meta(self) -> dict[str, Any]:
+        if self.graph_mode:
+            return {
+                "protocol_version": self.protocol.SCENE_PROTOCOL_VERSION,
+                "graph_hash": self.graph["manifest_hash"],
+                "state_layout": self.graph_layout,
+                "num_dof": self.num_dof,
+                "num_bodies": self.num_bodies,
+                "dof_names": list(self.contract_joint_names),
+                "body_names": list(self.contract_body_names),
+                "gravity": [0.0, 0.0, -9.81],
+                "use_gpu_pipeline": True,
+                "graphics_enabled": self.render_mode != "none",
+                "render_mode": self.render_mode,
+                "render_width": self.render_width,
+                "render_height": self.render_height,
+                "env_origins": self.env_origins.tolist(),
+                "collision_filtering_applied": self.collision_filtering_applied,
+            }
         return {
             "num_dof": self.num_dof,
             "num_bodies": self.num_bodies,
