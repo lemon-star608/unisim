@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from unisim.scene_assets import GraphSceneCfg
 from unisim.terrain.generator import TerrainGeneratorCfg
 
 if TYPE_CHECKING:
@@ -54,6 +55,15 @@ class SceneCfg:
     visual_model_file: str | None = None
     default_keyframe_name: str | None = None
     """Optional named keyframe used as the Manager-Based default state."""
+
+
+__all__ = [
+    "GraphSceneCfg",
+    "SceneCfg",
+    "TerrainSceneCfg",
+    "resolve_scene_default_qpos",
+    "resolve_scene_fragment_path",
+]
 
 
 def resolve_scene_default_qpos(cfg: SceneCfg, backend: SimBackend) -> np.ndarray | None:

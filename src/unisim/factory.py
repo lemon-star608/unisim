@@ -7,6 +7,7 @@ from typing import Any
 
 from .adapters import adapter_spec
 from .contract import BackendError, SimBackend
+from .scene_assets import GraphSceneCfg
 
 
 def create_backend(
@@ -20,6 +21,8 @@ def create_backend(
     body_state_required = kwargs.pop("body_state_required", False)
     if not isinstance(body_state_required, bool):
         raise TypeError("body_state_required must be bool")
+    if isinstance(scene, GraphSceneCfg) and backend_type != "isaacsim":
+        raise ValueError("GraphSceneCfg is supported only by the isaacsim backend")
     if backend_type == "fake":
         from .fake import FakeBackend
 

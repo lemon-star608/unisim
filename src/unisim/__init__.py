@@ -41,6 +41,17 @@ __all__ = [
     "assert_backend_conformance",
     "adapter_spec",
     "create_backend",
+    "AssetSource",
+    "EntityDescriptor",
+    "EntityStateLayout",
+    "GraphSceneCfg",
+    "ImporterProfile",
+    "NameBinding",
+    "RoleAssetVariant",
+    "SceneAssetGraph",
+    "StateLayout",
+    "StateSegment",
+    "derive_state_layout",
 ]
 
 
@@ -66,6 +77,24 @@ def __getattr__(name: str):
         "MjcfSubprocessBackend": (".backend.subprocess_ipc.backend", "MjcfSubprocessBackend"),
         "SubprocessWorkerError": (".backend.subprocess_ipc.backend", "SubprocessWorkerError"),
     }
+    if name in {
+        "AssetSource",
+        "EntityDescriptor",
+        "EntityStateLayout",
+        "GraphSceneCfg",
+        "ImporterProfile",
+        "NameBinding",
+        "RoleAssetVariant",
+        "SceneAssetGraph",
+        "StateLayout",
+        "StateSegment",
+        "derive_state_layout",
+    }:
+        from . import scene_assets
+
+        value = getattr(scene_assets, name)
+        globals()[name] = value
+        return value
     target = modules.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
