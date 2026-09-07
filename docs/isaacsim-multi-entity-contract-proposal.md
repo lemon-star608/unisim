@@ -4,8 +4,8 @@ Status: U0 proposal for maintainer review (docs-only; no implementation in this
 commit).  The audit was performed against UniSim
 `b7522885caa6aa1c6763e56f8303365958e225d3`, official UniSim main
 `f69e7b2025a301e6e0ce57021d6baaa232741e1e`, and the versioned SimToolReal
-references `baa5096077d5ad48e5c49265593281d6ffc499ce`, `2868d94e`, and
-`84058661`.  The checkout of the original SimToolReal repository was dirty; no
+references `baa5096077d5ad48e5c49265593281d6ffc499ce`, `2868d94e93d6c6e9023999dae32d3c59e87b66d1`, and
+`84058661e297576f0849a25782c6fc49d611338d`.  The checkout of the original SimToolReal repository was dirty; no
 working-tree content was used as evidence.
 
 This proposal is intentionally backend-neutral.  It does not add a task type,
@@ -14,19 +14,37 @@ same contract, not a deliverable of U0.
 
 ## Executive decision
 
-Add an additive, backend-neutral scene asset graph and entity-state contract to
-UniSim.  Keep the current single-MJCF/single-articulation route byte-for-byte
-compatible at the public NumPy boundary.  Add a separate role-asset variant
-pool for multi-entity scenes; do **not** change `ModelVariantSpec`, which remains
-the complete-MuJoCo-model startup variant used by the existing MuJoCo adapter.
+Add only an additive, backend-neutral graph scene input and role-asset variant
+types to UniSim.  Keep the current single-MJCF/single-articulation route
+byte-for-byte compatible at the public NumPy boundary.  Do **not** add entity
+reset, selected-wrench, or qualified resolver methods: the reviewed UniLab
+owner already composes selected writes into complete `set_state` rows and
+expands selected wrench rows into the existing dense interval-DR payload.
 
-The graph is frozen on the host cold path, serialized in a versioned `INIT`
-message, materialized by the worker, and acknowledged with immutable mappings.
-The worker owns native actor/prim/tensor indices.  The host and task use only
-stable entity-qualified names and backend-neutral virtual state columns.  A
-selected-entity reset and selected-environment wrench operation are additive
-APIs; the legacy `set_state` and all-environment `apply_body_force` semantics
-remain unchanged.
+The graph deterministically derives one global qpos/qvel/body layout.  Every
+floating entity is addressable through the existing `BackendRootStateLayout`;
+every joint and body has a stable, globally unique public name consumed by the
+existing name APIs.  The graph is frozen on the host cold path, serialized in
+a versioned `INIT` message, materialized by the worker, and acknowledged with
+the same derived layout.  Native actor/prim/tensor indices remain worker-private.
+`ModelVariantSpec` remains the complete-MuJoCo-model startup variant used by the
+existing MuJoCo adapter.
+
+## Audit baselines and citation convention
+
+* UniSim source and line citations refer to
+  `b7522885caa6aa1c6763e56f8303365958e225d3`.
+* UniLab owner citations refer to the fixed evidence commit
+  `05458806a767a89d98915932647c33d42a19b837`.
+* Current Manager-Based SimToolReal owner citations refer to versioned commit
+  `af5233051b2e0fee844f35485ef4a44767f35e27`.
+* Original IsaacSim semantics cite their full file path, full commit SHA, and
+  line range.  They were read with `git show`; the dirty original working tree
+  was not used.
+
+For compactness, UniSim citations below use `path:line` after this explicit
+baseline declaration; UniLab and original SimToolReal citations retain their
+full commit inline.
 
 ## Current facts and constraints
 
@@ -49,7 +67,9 @@ remain unchanged.
   `:1079-1100`).
 * `set_state` accepts selected environment rows but requires a complete qpos/qvel
   row for the one actor (`src/unisim/backend/base.py:581-607`).  There is no
-  entity selector.
+  entity selector.  Graph mode can reuse this exact call by making its complete
+  row width the derived `StateLayout` width; the method signature and selected
+  row masking do not change.
 * `apply_body_force` already states world-frame force/optional torque with shape
   `(num_envs, len(body_ids), 3)` and “upcoming step” staging
   (`src/unisim/backend/base.py:657-680`).  It has no selected-env argument.
@@ -63,6 +83,63 @@ remain unchanged.
   The architecture and migration docs explicitly describe this as a MuJoCo
   startup source-model feature (`docs/architecture.md:41-47`,
   `docs/migration.md:28-37`, `CHANGELOG.md:5-9`).
+
+### Existing UniLab owner surface
+
+The fixed UniLab evidence shows that no entity-specific backend write API is
+needed:
+
+* `ResetStateTransaction` owns full default/current qpos and qvel arrays and
+  explicitly promises one final `SimBackend.set_state` call
+  (`src/unilab/base/reset_state.py @
+  05458806a767a89d98915932647c33d42a19b837 : 1-5, 31-65`).
+* `write_joint_state` stages only the resolved joint columns for selected rows,
+  while retaining the other columns from the default/transaction image
+  (`src/unilab/base/reset_state.py @
+  05458806a767a89d98915932647c33d42a19b837 : 406-469`).
+* `write_root_state` uses any `BackendRootStateLayout`; root pose is copied to
+  its seven columns and world angular velocity is converted to the existing
+  body-frame generalized qvel convention
+  (`src/unilab/base/reset_state.py @
+  05458806a767a89d98915932647c33d42a19b837 : 471-550`).
+* `commit` collects every dirty entity write and submits complete rows once,
+  preserving selected-environment isolation
+  (`src/unilab/base/reset_state.py @
+  05458806a767a89d98915932647c33d42a19b837 : 552-588`).
+* `Entity` already resolves its declared root with `get_body_ids`, joints with
+  the existing joint-index methods, and bodies with `get_body_ids`; the
+  returned IDs are checked for integer dtype, shape, non-negativity, and
+  uniqueness (`src/unilab/base/entity.py @
+  05458806a767a89d98915932647c33d42a19b837 : 53-84, 582-640, 711-725`).
+  It obtains and validates `BackendRootStateLayout` against the complete
+  defaults (`src/unilab/base/entity.py @
+  05458806a767a89d98915932647c33d42a19b837 : 927-979`).
+* `Entity.apply_body_wrench_to_sim` accepts selected rows, validates
+  `(len(env_ids), len(body_ids), 3)`, expands them into zero-filled
+  `(num_envs, len(body_ids), 3)` arrays, and sends the existing
+  `IntervalRandomizationPlan` (`src/unilab/base/entity.py @
+  05458806a767a89d98915932647c33d42a19b837 : 1665-1776`).
+
+The existing MuJoCo interval path clears pending external wrenches at the
+start of a non-empty plan, accumulates force and torque operations, applies the
+dense rows to the upcoming `step`, and clears them after stepping
+(`src/unisim/backend/mujoco/backend.py:1260-1319, 1000-1039, 1435-1471`).
+IsaacSim must implement those same declared semantics; it does not need a new
+selected-wrench method.
+
+The current SimToolReal task uses those paths directly: its reset term stages
+robot joint state and object root pose/velocity in one manager transaction
+(`src/simtoolreal_rl_unilab/tasks/simtoolreal/reset.py @
+af5233051b2e0fee844f35485ef4a44767f35e27 : 99-180`), while its action term
+binds public object body IDs and stages dense world-frame force/torque through
+`Entity.apply_body_wrench_to_sim`
+(`src/simtoolreal_rl_unilab/tasks/simtoolreal/action.py @
+af5233051b2e0fee844f35485ef4a44767f35e27 : 234-293, 352-401`).
+
+Therefore a graph-derived complete state row, one existing root layout per
+floating entity, and global unique names are sufficient.  There is no concrete
+counterexample requiring a new public method; this revision removes the three
+previously proposed method/resolver surfaces.
 
 ### Subprocess IPC and worker
 
@@ -103,30 +180,46 @@ remain unchanged.
 
 The original IsaacSim config declares separate robot/table URDFs, a 100-sample
 pool per selected logical type, and force/torque DR
-(`isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py:55-101`, `:478-489`,
-commit `baa5096077d5ad48e5c49265593281d6ffc499ce`).  Its scene builder converts
-role-specific URDFs, bakes object and goal-viz USDs, and spawns robot, table,
-object, and goal entities (`isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py:151-192`,
-`2868d94e:1539-1705`).  `MultiUsdFileCfg(random_choice=False)` is used for
-round-robin object variants (`2868d94e:187-192`), while the config requires
-`replicate_physics=False` and `clone_in_fabric=False` for heterogeneous USDs
-(`baa5096077d5ad48e5c49265593281d6ffc499ce:568-585`).
+(`isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py @
+baa5096077d5ad48e5c49265593281d6ffc499ce : 55-101, 478-489`).  Its scene
+builder converts role-specific URDFs, bakes object and goal-viz USDs, and spawns
+robot, table, object, and goal entities
+(`isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 151-192, 1539-1705`).  `MultiUsdFileCfg(random_choice=False)` is
+used for round-robin object variants
+(`isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 187-192`), while the config requires `replicate_physics=False` and
+`clone_in_fabric=False` for heterogeneous USDs
+(`isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py @
+baa5096077d5ad48e5c49265593281d6ffc499ce : 568-585`).
 
 The generator uses a fixed seed, samples each matching distribution, emits one
 URDF per sample, normalizes scale, and shuffles paths/scales in lockstep
-(`2868d94e:302-399`).  At runtime the task resolves canonical robot joint order,
+(`isaacsimenvs/tasks/simtoolreal/utils/generate_objects.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 302-399`).  At runtime the task resolves canonical robot joint order,
 palm and fingertip body IDs, and per-env object state buffers
-(`2868d94e:23-67`).  Object reset is selected-env only and writes object pose,
-velocity, and per-env reference height (`2868d94e:271-301`); full reset clears
-only selected rows of queues, trackers, and wrench buffers
-(`2868d94e:384-418`).  Wrench DR is a per-env `(N, 1, 3)` force and torque,
+(`isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 23-67`).  Object reset is selected-env only and writes object pose,
+velocity, and per-env reference height
+(`isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 271-301`); full reset clears only selected rows of queues, trackers,
+and wrench buffers
+(`isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 384-418`).  Wrench DR is a per-env `(N, 1, 3)` force and torque,
 world-frame, global application staged before physics
-(`2868d94e:77-130`).  Observations read robot palm/fingertips, object and goal
-state with delay/noise (`2868d94e:231-340`), rewards update lift/progress/success
-terms (`2868d94e:92-145`), and termination advances the goal before evaluating
-fall/hand-far/timeout masks (`2868d94e:39-72`).  Commit `84058661` additionally
-authors adjacent-link `FilteredPairsAPI` self-collision filters
-(`84058661:1309-1361`).
+(`isaacsimenvs/tasks/simtoolreal/utils/action_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 77-130`).  Observations read robot palm/fingertips, object and goal
+state with delay/noise
+(`isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 231-340`), rewards update lift/progress/success terms
+(`isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 92-145`), and termination advances the goal before evaluating
+fall/hand-far/timeout masks
+(`isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py @
+2868d94e93d6c6e9023999dae32d3c59e87b66d1 : 39-72`).  Commit `84058661e297576f0849a25782c6fc49d611338d` additionally authors adjacent-link
+`FilteredPairsAPI` self-collision filters
+(`isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py @
+84058661e297576f0849a25782c6fc49d611338d : 1309-1361`).
 
 These references establish semantics only.  Their DirectRLEnv, IsaacLab views,
 actor handles, and task-private fields are not a UniSim interface.
@@ -135,15 +228,15 @@ actor handles, and task-private fields are not a UniSim interface.
 
 | Boundary | Current evidence | Concrete gap | Owner / decision |
 |---|---|---|---|
-| Scene input | `SceneCfg.model_file` and untyped `entities` (`scene.py:41-48`) | Cannot describe four roles, source format, importer profile, or role variants | **UniSim public** graph; maintainer must approve name/version shape |
+| Scene input | `SceneCfg.model_file` and untyped `entities` (`scene.py:41-48`) | Cannot describe four roles, source format, importer profile, or role variants | **UniSim public** separate graph scene config; maintainer must approve name/version shape |
 | XML metadata | One MJCF scanner and one free-joint (`sensors.py:147-175`, `:544-613`) | URDF/USD sources are rejected or incorrectly scanned as MJCF | **Adapter-private** native materializers; graph route bypasses MJCF scan |
 | INIT | One `model_file`, one root, one name list (`subprocess_ipc/backend.py:403-435`) | No graph, assignments, cache provenance, or layout version | **Internal IPC** `INIT_V2` payload with protocol version |
 | Slots | One root/DoF/body tensor set (`protocol.py:79-115`) | No entity segments, selected reset, or staged wrench | **Internal IPC** additive slots/commands |
 | Root state | Root-first 7/6 layout and one-body layout (`base.py:57-95`, `subprocess_ipc/backend.py:935-951`) | Fixed-base robot plus dynamic object cannot share one root | **Public** layout descriptor plus legacy mode |
-| State write | Full actor qpos/qvel rows (`base.py:581-607`; worker `:584-624`) | Object-only reset would overwrite robot or require task private handles | **Public** selected entity-state method; legacy method unchanged |
-| Names | Global IDs in importer/XML order (`subprocess_ipc/backend.py:957-1001`) | No entity namespace; variant-dependent native IDs | **Public** qualified-name resolver; native IDs stay worker-private |
+| State write | Full actor qpos/qvel rows (`base.py:581-607`; worker `:584-624`) | Needs graph-derived complete row; no new entity write method | **Reuse** `ResetStateTransaction` + `set_state`; worker writes segment columns |
+| Names | Global IDs in importer/XML order (`subprocess_ipc/backend.py:957-1001`) | Graph must publish globally unique public names and worker permutation | **Reuse** `get_body_ids` / existing joint APIs; no new resolver |
 | Variants | `ModelVariantSpec` is complete MJCF source (`dr/types.py:38-46`) | Cannot assign object/table/goal role assets | **Public additive** role-asset variant; preserve `ModelVariantSpec` |
-| Wrench | All-env world-frame API (`base.py:657-680`) | No selected env and no IPC transport; Isaac worker has no effect path | **Public additive** selected request; **worker** implementation |
+| Wrench | All-env world-frame API (`base.py:657-680`) | Isaac worker lacks transport/effect implementation; selected rows are already densified by UniLab | **Reuse** `apply_body_force` / `IntervalRandomizationPlan`; **worker** implementation only |
 | DR | Built-in shape is all-env and Isaac capability set is empty (`interval.py:52-93`, `subprocess_ipc/backend.py:1108-1119`) | SimToolReal force/torque and required reset DR fail closed | Capability declaration plus real physics conformance; no silent downgrade |
 | Heterogeneous USD | Current worker clones one USD articulation (`isaacsim/worker.py:238-321`) | Fabric/replication can erase per-env asset identity | IsaacSim adapter-private spawning policy, tested with real runtime |
 | Cache | Current worker converts on every single-model materialization (`isaacsim/worker.py:237-251`) | No content-addressed URDF→USD cache, atomicity, or diagnostics | UniSim cache owner; task owns canonical source manifest |
@@ -174,6 +267,10 @@ RoleAssetVariant
   role_metadata_hash: lowercase 64-hex hash
   scale: finite float32 tuple (3,)
 
+NameBinding
+  public_name: non-empty globally unique name used by existing SimBackend APIs
+  source_name: non-empty name in this variant's importer namespace
+
 EntityDescriptor
   name: non-empty stable name, unique in graph
   kind: "articulation" | "rigid" | "kinematic" | "visual"
@@ -182,24 +279,36 @@ EntityDescriptor
   collision_enabled: bool
   visual_only: bool
   root_body_name: non-empty name or None
-  joint_names: unique tuple of stable names
-  body_names: unique tuple of stable names
+  joint_bindings: unique tuple[NameBinding]
+  body_bindings: unique tuple[NameBinding]
   variants: non-empty tuple[RoleAssetVariant, ...]
   env_variant_ids: int32 array shape (num_envs,)
+  include_root_state: bool
+  default_joint_qpos: finite float array shape (len(joint_bindings),)
+  default_joint_qvel: finite float array shape (len(joint_bindings),)
+  default_root_qpos: finite float array shape (7,) or None
+  default_root_qvel: finite float array shape (6,) or None
 
 SceneAssetGraph
   schema_version: positive int
   num_envs: positive int
   entities: immutable tuple[EntityDescriptor, ...]
-  state_layout: StateLayout
   manifest_hash: lowercase 64-hex hash
+
+GraphSceneCfg
+  graph: SceneAssetGraph
+  cache_root: absolute path or None
+  terrain: TerrainSceneCfg or None
 ```
 
 `EntityDescriptor` is deliberately generic.  A fixed-base robot articulation,
 dynamic object rigid body, fixed/kinematic table, and visual-only goal object are
 represented respectively by `kind`, `fixed_base`, `gravity_enabled`,
 `collision_enabled`, and `visual_only`; no robot or task class appears in the
-contract.  The goal entity may share the object's variant IDs but must have
+contract.  `joint_bindings` and `body_bindings` map source importer names to
+stable public names; public names are unique across the whole graph even when
+two source assets use the same local name.  The goal entity may share the
+object's variant IDs but must have
 `visual_only=True`, `collision_enabled=False`, and `gravity_enabled=False`.
 Assignments are explicit per environment; directory ordering, implicit random
 choice, and worker RNG are not assignment sources.
@@ -211,20 +320,104 @@ Validation is cold-path and fail-closed:
    entity-qualified names are unique graph-wide.
 2. `env_variant_ids` is int32, one-dimensional, exactly `num_envs` long, and
    every index is in `[0, len(variants))`.
-3. `articulation` entities have at least one joint; `rigid`, `kinematic`, and
-   `visual` entities have no joints unless a backend profile explicitly
-   declares a multi-DoF articulation.  `fixed_base=True` forbids a root-state
-   segment.  A dynamic rigid entity must have exactly one root body.
-4. Scales and all numeric metadata are finite.  Unsupported `format`, importer
-   option, role, or capability is a construction error, never a fallback.
-5. `manifest_hash` covers canonical serialized fields and assignment arrays.
+3. `public_name` values are unique graph-wide; `source_name` values are unique
+   within each entity/variant.  Every variant must resolve every binding exactly
+   once.  `root_body_name`, when present, must refer to one body binding.
+4. `articulation` entities have at least one joint; `rigid`, `kinematic`, and
+   `visual` entities have no joints.  `fixed_base=True` on an articulation
+   forbids a root-state segment; fixed/kinematic rigid entities may still expose
+   a writable root.  A dynamic rigid entity must have exactly one root body and
+   `include_root_state=True`.
+   The initial graph contract permits only one-DoF joints, so one binding equals
+   one qpos and one qvel column; any multi-DoF joint fails closed.
+5. Default arrays have exactly the declared widths.  Root qpos is xyz+wxyz,
+   root qvel is world-linear/body-angular; quaternions are finite and unit
+   length.  An entity with `include_root_state=False` must provide no root
+   defaults.  Scales and all other numeric metadata are finite.  Unsupported
+   `format`, importer option, role, or capability is a construction error,
+   never a fallback.
+6. `manifest_hash` covers canonical serialized fields, bindings, defaults, and
+   assignment arrays.
    Mutating an input array after construction is impossible (copy and mark
    read-only).
+7. `GraphSceneCfg.graph` must be a validated `SceneAssetGraph`; `cache_root`,
+   when present, is one absolute existing-or-creatable directory and is the
+   only cache root in the request.  `GraphSceneCfg` has no legacy model path.
+
+`StateLayout` is not caller input.  `derive_state_layout(SceneAssetGraph)` is
+the single owner of layout generation; it returns immutable metadata described
+below.  Callers cannot provide a second competing layout.
+
+### Mutually exclusive scene inputs
+
+Keep `SceneCfg(model_file=...)` unchanged for every legacy consumer.  Introduce
+the separate `GraphSceneCfg(graph=..., cache_root=...)` input rather than making
+`model_file` nullable.  The backend factory accepts exactly one of these two
+types; a mapping that supplies both, a missing graph, or an unknown scene type
+is rejected before materialization.  A `GraphSceneCfg` has no `model_file`,
+`fragment_files`, or MJCF keyframe selector, so the graph route cannot enter
+`scan_scene_metadata`.  A `SceneCfg` with a non-empty `model_file` always takes
+the current MJCF path; its behavior and constructor compatibility do not
+change.
+
+UniLab's existing `unilab.base.scene.SceneCfg` remains the subclass of
+`unisim.scene.SceneCfg` and continues to materialize Hydra entity mappings.  A
+future graph owner adds a sibling `unilab.base.scene.GraphSceneCfg` subclass of
+`unisim.scene.GraphSceneCfg` and performs the same entity-mapping conversion;
+it does not put a graph into the legacy `model_file` field.  Existing config
+adapters that replace or inspect `SceneCfg.model_file` stay on the legacy branch;
+the graph owner passes its resolved `GraphSceneCfg` directly to `create_backend`.
 
 ### State layout
 
-`StateLayout` is an immutable list of explicit segments.  Segment order is part
-of the graph hash, not an incidental backend order.
+`StateSegment` and `EntityStateLayout` are read-only derived types; callers do
+not supply them:
+
+```text
+StateSegment
+  entity_name: non-empty string
+  component: "root" | "joints"
+  qpos_start: non-negative int
+  qpos_width: positive int
+  qvel_start: non-negative int
+  qvel_width: positive int
+  public_names: tuple[str, ...]
+
+EntityStateLayout
+  entity_name: string
+  root: BackendRootStateLayout | None
+  joint_qpos_indices: int tuple (len(joint_bindings),)
+  joint_qvel_indices: int tuple (len(joint_bindings),)
+  body_public_names: tuple[str, ...]
+  body_ids: int32 readonly array (len(body_bindings),)
+
+StateLayout
+  qpos_width: positive int
+  qvel_width: positive int
+  segments: tuple[StateSegment, ...]
+  entities: tuple[EntityStateLayout, ...]
+  public_joint_names: tuple[str, ...]
+  public_body_names: tuple[str, ...]
+  default_qpos: float readonly array (qpos_width,)
+  default_qvel: float readonly array (qvel_width,)
+```
+
+Validation of the derived types is deterministic: segment starts and widths
+are Python integers (not bool), widths are positive, component names have the
+exact declared length, segment public names are unique, and every index lies in
+the complete qpos/qvel width.  `EntityStateLayout.root` is either `None` or an
+existing `BackendRootStateLayout` with exactly seven qpos and six qvel columns;
+joint index tuples are integer, unique, and in range.  `body_ids` is int32,
+one-dimensional, read-only, and has one entry per body binding.  Default arrays
+are one-dimensional finite floating arrays with exactly `qpos_width` and
+`qvel_width` entries.  A worker `META` that changes any of these fields or the
+graph hash is rejected before slots attach.
+
+`derive_state_layout(graph)` visits the graph's entity tuple in declared order.
+For each entity it emits a root segment first when `include_root_state=True`,
+then a joints segment when joints exist.  Segment order, public names, and
+default arrays are therefore determined by the descriptor and included in the
+graph hash; there is no caller-provided second truth.
 
 | Segment | qpos columns | qvel columns | Notes |
 |---|---:|---:|---|
@@ -235,65 +428,42 @@ of the graph hash, not an incidental backend order.
 
 For the proposed manipulation graph the canonical order is robot joint columns,
 then object root columns, then any additional declared segments in descriptor
-order.  `get_state()` for a graph scene returns the concatenation described by
-`StateLayout`; `get_state()` for a legacy scene remains exactly root-first
-`[root, dofs]`.  Body state is always `(num_envs, num_bodies, 13)` in stable
-qualified-name order: position 3, quaternion wxyz 4, world linear velocity 3,
-world angular velocity 3.  `get_root_state_layout(entity, body)` returns the
-explicit segment columns and retains the existing world-linear/body-angular
-`set_state` convention.  Manager-facing helpers may expose world angular
-velocity, but conversion is performed at the contract boundary.
+order.  `qpos_start`/`qvel_start` must be contiguous: starts at zero, widths are
+positive, the next start equals the previous end, and the final ends equal
+`qpos_width`/`qvel_width`.  Thus there are no overlaps or holes.  A fixed-base
+robot contributes joints only; a dynamic object contributes one seven/six root
+segment; a table or visual goal contributes a root only when its descriptor
+sets `include_root_state=True`.
 
-### Stable entity-qualified names
+`get_state()` for a graph scene is a backend override that returns the
+concatenation described by the derived `StateLayout`; `get_state()` for a legacy scene remains exactly
+root-first `[root, dofs]`.  Body state is always
+`(num_envs, num_bodies, 13)` in global public-name order: position 3,
+quaternion wxyz 4, world linear velocity 3, world angular velocity 3.
+`get_root_state_layout(root_body_name)` remains the existing API for each
+floating entity and returns the seven/six columns of that entity's root segment.
 
-The graph exposes names such as `robot.joint.iiwa14_joint_1`,
-`robot.body.palm`, `robot.body.fingertip_0`, and `object.body.root`.  A new
-resolver returns virtual IDs and column indices:
+Default qpos/qvel are the descriptor defaults concatenated in segment order.
+Root qpos is world xyz/wxyz; generalized qvel stores world linear and body-frame
+angular velocity, exactly as `BackendRootStateLayout` and
+`ResetStateTransaction` already specify.  Worker `META` must echo graph hash,
+segment starts/widths, public joint/body names, default widths, and each
+source-to-public permutation; the host rejects any mismatch before `READY`.
 
-```text
-resolve_entity_joints(entity="robot", names=(...)) -> JointIndexView
-resolve_entity_bodies(entity="robot", names=("palm", ...)) -> BodyIndexView
-get_entity_state_layout(entity="object") -> EntityStateLayout
-```
+The graph uses stable global public names such as `robot_joint_1`, `robot_palm`,
+`robot_fingertip_0`, and `object_root`.  Existing `get_body_ids` and joint-name
+APIs resolve those names once on the cold path.  No `JointIndexView`,
+`BodyIndexView`, qualified resolver, or entity-specific state/wrench method is
+retained.  UniLab's `Entity` keeps its existing local name tuples and cached
+backend IDs; the graph's only new requirement is that descriptors guarantee
+global uniqueness and variant signature stability.
 
-Resolution occurs once during materialization from the descriptor and worker
-name mapping.  It rejects missing, duplicate, or variant-inconsistent names.
-Task code never sees a USD prim path, PhysX view, actor handle, worker field, or
-native integer ID.  Existing `get_body_ids`/joint-index methods remain aliases
-for the legacy unqualified scene only; using them with a graph scene without an
-entity qualifier fails closed.
-
-### Selected entity reset and wrench
-
-Add a public `set_entity_state(entity, env_ids, root_qpos=None,
-root_qvel=None, joint_qpos=None, joint_qvel=None)` operation.  `env_ids` is a
-unique int32 vector; each supplied array has first dimension `len(env_ids)` and
-the exact segment width.  A call changes only the named entity and selected
-rows.  It must not write robot, table, goal, or unselected rows.  The existing
-`set_state(env_indices, qpos, qvel)` remains the complete legacy-actor reset.
-
-Add a public `apply_body_wrench(env_ids, body_ids, force, torque=None)`
-operation.  Its validated shapes are:
-
-```text
-env_ids:  int32, shape (M,), unique, in range
-body_ids: int32, shape (K,), unique stable virtual body IDs
-force:    float32/float64, shape (M, K, 3), finite
-torque:   optional same shape, finite
-```
-
-Force and torque are world-frame.  The request replaces/accumulates only the
-addressed `(env, body, channel)` entries according to the backend's declared
-capability; the recommended default is additive within one staging window, as
-the MuJoCo implementation does (`src/unisim/backend/mujoco/backend.py:1435-1471`).
-It is staged before the next `step` call, applies to every physics substep of
-that call (preserving existing `step(nsteps)` semantics), and is cleared after
-the call.  `set_entity_state` clears pending wrench rows only for its selected
-environments; a full `reset` clears all rows.  Unselected rows and other bodies
-are unchanged.  A backend lacking force or torque support raises
-`NotImplementedError` before mutating state.  The existing all-environment
-`apply_body_force` remains valid and may delegate to this operation with all
-environment IDs.
+Selected reset and selected wrench behavior therefore stay at the owner layer:
+`ResetStateTransaction` merges robot/object/table/goal column writes into one
+complete-row `set_state`, while `Entity.apply_body_wrench_to_sim` expands
+selected rows into dense all-env `IntervalRandomizationPlan` payloads.  UniSim
+only needs to make the graph-derived complete layout and dense wrench path work
+in the worker; no new public operation is required.
 
 ## Proposed internal IPC types
 
@@ -310,8 +480,8 @@ InitScenePayloadV2
 
 EntityMeta
   entity_name, kind, variant_count, env_variant_ids
-  qualified_joint_names, qualified_body_names
-  public_qpos/qvel slices
+  public_joint_names, public_body_names
+  derived qpos/qvel segments and complete-row widths
   capability flags
 
 WorkerMetaV2
@@ -320,21 +490,21 @@ WorkerMetaV2
   native-to-public permutations (worker-owned after validation)
   per-env local origins, collision-filter status
 
-EntityResetBatch
-  count, env_ids, entity_ids, root_qpos/root_qvel, joint_qpos/joint_qvel
-
-WrenchBatch
-  count_envs, count_bodies, env_ids, body_ids, values[..., 6]
-  (force xyz followed by torque xyz)
+DenseWrenchBatch (internal only)
+  body_ids: int32 shape (K,)
+  force: float32 shape (num_envs, K, 3)
+  torque: optional float32 shape (num_envs, K, 3)
+  selected rows are already zero-filled by the UniLab Entity owner
 ```
 
 The existing `INIT`, slots, and commands are retained for the legacy route.  A
 graph route negotiates `scene-v2` and rejects unknown versions, malformed hashes,
-missing entities, assignment length mismatches, or unsupported capabilities.
-Suggested additional shared-memory slots are `entity_state`,
-`entity_reset_env_ids`, `entity_reset_entity_ids`, `entity_reset_values`, and
-`wrench_values`; command payloads carry validated counts only.  Fixed slot
-capacity is computed during `INIT`; a request exceeding it fails before writes.
+missing entities, assignment length mismatches, layout gaps, or unsupported
+capabilities.  `CMD_SET_STATE` keeps its existing selected environment IDs but
+its qpos/qvel slot widths are the derived complete graph widths.  Additional
+internal slots carry dense body-force/body-torque arrays and body IDs for the
+existing interval plan; there is no entity-reset command.  Fixed slot capacity
+is computed during `INIT`; a request exceeding it fails before writes.
 No tensor/zero-copy extension is proposed until a profile demonstrates that
 NumPy shared-memory copies block an accepted capacity gate.
 
@@ -352,7 +522,7 @@ flowchart LR
     S --> P[Worker physics substeps]
     P --> D[refresh entity/root/body slots]
     D --> H
-    H --> Q[ENTITY_RESET: selected rows/segments]
+    H --> Q[SET_STATE: selected complete rows]
     Q --> P
 ```
 
@@ -372,7 +542,7 @@ is allowed after materialization.
 | Validate graph, source hashes, revisions, importer profile, assignments | Use frozen virtual IDs, slices, assignments, and numeric arrays |
 | Parse MJCF for the legacy route; generate/convert URDF and USD for graph route | Read/write shared-memory state and controls |
 | Compute cache key, lock, atomically write and hash artifacts | Stage world-frame wrench and selected reset rows |
-| Resolve qualified names and native permutations | Apply cached native IDs; no name lookup |
+| Resolve public names and native permutations | Apply cached native IDs; no name lookup |
 | Create GridCloner prims, actor views, collision filters, Fabric policy | Physics stepping, state refresh, reward/termination consumers |
 | Build capability and interval handler tables | Fail immediately on shape/capability violations |
 
@@ -384,9 +554,18 @@ mass/COM/inertia, topology/material identifiers, source revision/license, and
 the deterministic `env_variant_ids` assignment.  It does not import IsaacSim,
 create prims, or call a converter.
 
+The task owner also owns the task cache policy.  It resolves exactly one
+absolute cache root using `SIMTOOLREAL_CACHE_DIR`, then XDG's task cache, then
+`~/.cache/simtoolreal`, and passes that resolved root as
+`GraphSceneCfg.cache_root` on the cold path.  A call must not provide a second
+root through an environment override or worker payload; UniSim rejects a
+conflicting root rather than choosing precedence implicitly.
+
 UniSim owns the converter invocation in the IsaacSim worker, role importer
-profiles, PhysX bake validation, cache locking, cache lifetime, and diagnostics.
-The cache key is the tuple:
+profiles, PhysX bake validation, cache content format, cache locking, cache
+lifetime, and diagnostics.  When `cache_root` is supplied, UniSim uses it
+verbatim and does not consult `~/.cache/unisim`; the latter is used only when
+the caller explicitly leaves `cache_root=None`.  The cache key is the tuple:
 
 ```text
 manifest_hash
@@ -397,9 +576,9 @@ manifest_hash
 + PhysX bake profile/version
 ```
 
-Cache precedence follows the UniSim runtime policy (`UNISIM_*` cache settings,
-then `~/.cache/unisim`); a task may pass a dedicated root but cannot write into
-tracked source.  Materialization writes to a unique temporary sibling, fsyncs
+The task-resolved root and UniSim's default root are mutually exclusive; a
+single invocation cannot create two caches for one manifest.  Neither root may
+be inside tracked source.  Materialization writes to a unique temporary sibling, fsyncs
 files and directory, validates the expected manifest/hash/version, then renames
 atomically.  A lock prevents duplicate writers.  A cache hit revalidates the
 manifest and converter/bake versions; a mismatch is a miss, not a silent reuse.
@@ -435,16 +614,20 @@ Reusable without semantic change:
   dispatch for dense all-env DR.
 * `SceneCfg.model_file` and MJCF scanner for single-model consumers.
 
-Requires a new public contract:
+The graph route adds only these public data/configuration types:
 
-* Immutable scene asset graph, role/source/importer/variant descriptors and
-  explicit assignment arrays.
-* Layout segments for multiple fixed-base and dynamic entities, and qualified
-  name resolvers.
-* Selected entity state write and selected-env wrench request.  These are
-  additive; changing the old method's positional meaning is forbidden.
-* Capability metadata that distinguishes graph scenes, entity reset, selected
-  wrench, and per-env heterogeneous assets.
+* `GraphSceneCfg`, `SceneAssetGraph`, `AssetSource`, `ImporterProfile`,
+  `RoleAssetVariant`, `NameBinding`, and `EntityDescriptor`.
+* Derived `StateSegment`, `EntityStateLayout`, and `StateLayout` metadata,
+  including complete-row defaults and global public-name lists.
+* A capability bit for graph materialization/heterogeneous assignment, without
+  changing the old reset or wrench methods.
+
+The existing `set_state`, `get_root_state_layout`, `get_body_ids`/joint APIs,
+`IntervalRandomizationPlan`, and `apply_body_force` are the public operations
+used by graph consumers.  No new public method is justified: the concrete
+owner call chain above is already able to express selected multi-entity reset
+and dense selected-env wrench writes.
 
 Adapter-private only:
 
@@ -460,9 +643,9 @@ No task or UniLab dependency is added to UniSim.
 Legacy scenes continue to pass one `model_file`, scan one MJCF, receive the
 existing slots, expose root-first qpos/qvel, and use the same `set_state`, body
 IDs, and `apply_body_force` calls.  The old `INIT` payload and protocol version
-remain supported.  A graph field absent means legacy mode; a graph field present
-selects the new negotiated mode.  Existing fake, MuJoCo, IsaacGym, and IsaacSim
-single-articulation consumers require no source change.
+remain supported.  `GraphSceneCfg` selects the new negotiated mode by type;
+there is no ambiguous graph field on legacy `SceneCfg`.  Existing fake, MuJoCo,
+IsaacGym, and IsaacSim single-articulation consumers require no source change.
 
 `ModelVariantSpec` remains a **complete MuJoCo model variant**.  Extending it
 with URDF/USD role fields would make `source_model_file` ambiguous, force an MJCF
@@ -472,59 +655,105 @@ new graph type.  A future migration may add a conversion helper from a complete
 MuJoCo variant to a graph only when the source semantics are explicit; it must
 not overload the existing field.
 
-## Minimal usage example (proposed U1 API)
+## Minimal usage example (proposed graph input)
 
 ```python
+from pathlib import Path
+
 import numpy as np
 
 from unisim import create_backend
-from unisim.scene import SceneCfg
-from unisim.scene_assets import (  # proposed module
-    AssetSource, EntityDescriptor, ImporterProfile, RoleAssetVariant,
-    SceneAssetGraph, StateLayout,
+from unisim.scene_assets import (
+    AssetSource, EntityDescriptor, GraphSceneCfg, ImporterProfile, NameBinding,
+    RoleAssetVariant, SceneAssetGraph, derive_state_layout,
 )
 
+def variant(name: str, profile: str) -> RoleAssetVariant:
+    return RoleAssetVariant(
+        variant_id=name,
+        source=AssetSource("urdf", f"assets/{name}.urdf", "revision-1", "a" * 64),
+        importer=ImporterProfile(profile, {"self_collision": False}),
+        role_metadata_hash="b" * 64,
+        scale=(1.0, 1.0, 1.0),
+    )
+
+env_ids = np.zeros(2, dtype=np.int32)
 robot = EntityDescriptor(
     name="robot", kind="articulation", fixed_base=True,
     gravity_enabled=False, collision_enabled=True, visual_only=False,
     root_body_name=None,
-    joint_names=("iiwa14_joint_1", "..."),
-    body_names=("palm", "fingertip_0"),
-    variants=(RoleAssetVariant(
-        variant_id="robot-v1",
-        source=AssetSource("urdf", "assets/robot.urdf", "robot-rev", "a" * 64),
-        importer=ImporterProfile("fixed-base-robot", {"self_collision": False}),
-        role_metadata_hash="b" * 64, scale=(1.0, 1.0, 1.0),
-    ),),
-    env_variant_ids=np.zeros(2, dtype=np.int32),
+    joint_bindings=(NameBinding("robot_joint_0", "joint_0"),
+                    NameBinding("robot_joint_1", "joint_1")),
+    body_bindings=(NameBinding("robot_palm", "palm"),
+                   NameBinding("robot_fingertip_0", "fingertip_0")),
+    variants=(variant("robot-v1", "fixed-base-robot"),),
+    env_variant_ids=env_ids, include_root_state=False,
+    default_joint_qpos=np.zeros(2), default_joint_qvel=np.zeros(2),
+    default_root_qpos=None, default_root_qvel=None,
+)
+object_entity = EntityDescriptor(
+    name="object", kind="rigid", fixed_base=False,
+    gravity_enabled=True, collision_enabled=True, visual_only=False,
+    root_body_name="object_root",
+    joint_bindings=(), body_bindings=(NameBinding("object_root", "root"),),
+    variants=(variant("object-v1", "dynamic-rigid"),),
+    env_variant_ids=env_ids, include_root_state=True,
+    default_joint_qpos=np.zeros(0), default_joint_qvel=np.zeros(0),
+    default_root_qpos=np.array([0, 0, 0.65, 1, 0, 0, 0]),
+    default_root_qvel=np.zeros(6),
+)
+table = EntityDescriptor(
+    name="table", kind="kinematic", fixed_base=True,
+    gravity_enabled=False, collision_enabled=True, visual_only=False,
+    root_body_name="table_root",
+    joint_bindings=(), body_bindings=(NameBinding("table_root", "root"),),
+    variants=(variant("table-v1", "kinematic-table"),),
+    env_variant_ids=env_ids, include_root_state=True,
+    default_joint_qpos=np.zeros(0), default_joint_qvel=np.zeros(0),
+    default_root_qpos=np.array([0, 0, 0.38, 1, 0, 0, 0]),
+    default_root_qvel=np.zeros(6),
+)
+goal = EntityDescriptor(
+    name="goal", kind="visual", fixed_base=True,
+    gravity_enabled=False, collision_enabled=False, visual_only=True,
+    root_body_name="goal_root",
+    joint_bindings=(), body_bindings=(NameBinding("goal_root", "root"),),
+    variants=(variant("object-v1", "visual-goal"),),
+    env_variant_ids=env_ids, include_root_state=True,
+    default_joint_qpos=np.zeros(0), default_joint_qvel=np.zeros(0),
+    default_root_qpos=np.array([0, 0, 0.75, 1, 0, 0, 0]),
+    default_root_qvel=np.zeros(6),
 )
 
-# table/object/goal descriptors are constructed the same way.
 graph = SceneAssetGraph(
-    schema_version=1, num_envs=2, entities=(robot, ...),
-    state_layout=StateLayout(...), manifest_hash="c" * 64,
+    schema_version=1, num_envs=2,
+    entities=(robot, object_entity, table, goal), manifest_hash="c" * 64,
 )
-backend = create_backend(
-    "isaacsim", scene=SceneCfg(model_file="legacy.xml", asset_graph=graph),
-    num_envs=2, sim_dt=1.0 / 120.0,
-)
+layout = derive_state_layout(graph)
+scene = GraphSceneCfg(graph=graph, cache_root=Path("/tmp/simtoolreal-cache").resolve())
+backend = create_backend("isaacsim", scene=scene, num_envs=2, sim_dt=1.0 / 120.0)
 backend.materialize()
-obj_root = backend.resolve_entity_bodies("object", ("root",))
-backend.set_entity_state(
-    "object", np.asarray([1], dtype=np.int32),
-    root_qpos=np.asarray([[0, 0, 0.65, 1, 0, 0, 0]], dtype=np.float32),
-    root_qvel=np.zeros((1, 6), dtype=np.float32),
-)
-backend.apply_body_wrench(
-    np.asarray([1], dtype=np.int32), obj_root,
-    np.zeros((1, 1, 3), dtype=np.float32),
-    np.asarray([[[0, 0, 1]]], dtype=np.float32),
-)
-backend.step(np.zeros((2, 29), dtype=np.float32))
+
+# Reset selected env 1 by editing a complete graph row; all other entities and
+# env 0 stay at their transaction defaults.
+qpos = np.broadcast_to(layout.default_qpos, (2, layout.qpos_width)).copy()
+qvel = np.broadcast_to(layout.default_qvel, (2, layout.qvel_width)).copy()
+object_root = layout.entities[1].root
+qpos[1, object_root.qpos_indices] = [0, 0, 0.70, 1, 0, 0, 0]
+backend.set_state(np.array([1], dtype=np.int32), qpos[1:2], qvel[1:2])
+
+# Selected rows are made dense by the Entity owner before this existing API.
+object_body = backend.get_body_ids(["object_root"])
+force = np.zeros((2, 1, 3), dtype=np.float32)
+torque = np.zeros_like(force)
+force[1, 0] = [0, 0, 1]
+backend.apply_body_force(object_body, force, torque=torque)
+backend.step(np.zeros((2, backend.num_actuators), dtype=np.float32))
 ```
 
-The ellipses are placeholders for descriptors in a real caller; the example is
-an API sketch, not runtime evidence.
+This is a complete graph construction with no XML placeholder.  It is an API
+sketch, not real IsaacSim evidence; the task owner supplies the resolved source
+URIs, hashes, and cache root on its cold path.
 
 ## Conformance test matrix
 
@@ -532,14 +761,14 @@ an API sketch, not runtime evidence.
 |---|---:|---:|---|
 | Graph/hash/schema validation and fail-closed unknown fields | Yes | No | Pure NumPy/stdlib tests |
 | Legacy `SceneCfg`/`INIT`/slots and qpos/qvel shape | Yes | No (plus existing adapter tests) | Existing consumers unchanged |
-| Explicit assignment length/range and stable qualified names | Yes | No | Fake native-name permutation |
-| Layout slices, root frame conversion, selected row masking | Yes | No | Fake worker must prove untouched rows |
+| Explicit assignment length/range and stable global public names | Yes | No | Fake native-name permutation |
+| Descriptor-derived layout slices, root frame conversion, selected row masking | Yes | No | Fake worker must prove untouched rows through complete `set_state` |
 | IPC serialization, slot bounds, malformed META diagnostics | Yes | No | Protocol fixture tests |
 | URDF/USD cache key, atomic publish, version mismatch | Fake converter | No for atomic logic | Native converter smoke separately |
 | IsaacSim robot/object/table/goal prim creation | No | **Yes** | Native Kit/PhysX stage census |
 | Fixed-base robot 29-joint response and palm/fingertip mapping | No | **Yes** | Real state read/target response |
-| Object-only reset leaves robot/table/goal and other env unchanged | No | **Yes** | 2–8 env selected-reset probe |
-| World-frame force/torque effect on next physics step | No | **Yes** | Acceleration/torque differential probe |
+| Object-only reset leaves robot/table/goal and other env unchanged | Yes (dense row merge) | **Yes** | 2–8 env complete-row `set_state` probe |
+| World-frame force/torque effect on next physics step | Yes (dense plan/staging) | **Yes** | Acceleration/torque differential probe |
 | Heterogeneous hammer/eraser assignment and mass/scale | No | **Yes** | Distinct USD and physical response |
 | Fabric/replication policy and collision isolation | No | **Yes** | Stage and PhysX filtering inspection |
 | 1200 materialization/cache hit census | No | **Yes** | 12 distributions × 100 native artifacts |
@@ -556,16 +785,20 @@ they must never be reported as real IsaacSim support or training evidence.
 Proposed files in separate commit:
 
 * `src/unisim/scene.py` and a new backend-neutral `src/unisim/scene_assets.py`:
-  immutable graph, descriptors, variants, assignments, layout, validation.
-* `src/unisim/backend/base.py`: additive entity metadata/resolution,
-  `set_entity_state`, `apply_body_wrench`, and capability labels; preserve old
-  methods exactly.
+  immutable graph, descriptors, variants, deterministic layout derivation, and
+  validation.  Add `GraphSceneCfg` without changing legacy `SceneCfg`.
+* `src/unisim/backend/base.py`: graph capability and complete-row layout
+  metadata only; preserve `set_state`, `get_root_state_layout`, global name
+  APIs, and `apply_body_force` exactly.
 * `src/unisim/dr/types.py` only if a reusable reset/wrench request type belongs
   there; do not alter `ModelVariantSpec` semantics.
 * `src/unisim/backend/subprocess_ipc/protocol.py` and `backend.py`: protocol
-  version negotiation, graph INIT, entity/reset/wrench slots and bounds checks.
+  version negotiation, graph INIT, complete-row layout metadata, dense wrench
+  slots, and bounds checks.  Keep `CMD_SET_STATE`; do not add an entity-reset
+  command.
 * `tests/test_contract.py`, `tests/test_dr_interval.py`, new graph/protocol tests,
-  and a fake multi-entity backend/conformance fixture.
+  and a fake multi-entity backend/conformance fixture proving complete-row
+  selected reset and dense selected-env wrench isolation.
 
 U1 commit must pass `make check`, demonstrate the old single-MJCF route, and
 reject unknown graph capabilities before any worker mutation.  It cannot claim
@@ -576,8 +809,8 @@ IsaacSim runtime support.
 Proposed files:
 
 * `src/unisim/backend/isaacsim/backend.py` and `worker.py`: native role loaders,
-  cached name maps, one robot articulation plus object/table/goal rigid views,
-  selected entity reset, and state publication.
+  cached global name maps, one robot articulation plus object/table/goal rigid
+  views, complete graph-row reset, and state publication.
 * `src/unisim/backend/isaacsim/assets.py` (or equivalent): converter/cache key,
   atomic materialization, version diagnostics.
 * IsaacSim-specific worker smoke/conformance tests and an external evidence
@@ -587,17 +820,17 @@ U2 is gated on U1 maintainer acceptance and must prove one real tool, object
   reset, robot joint/body reads, and wrench physics effect.  It must not start a
   1200-pool optimization.
 
-### U3 — heterogeneous assignment, selected reset, wrench
+### U3 — heterogeneous assignment, complete-row reset, dense wrench
 
 Proposed files:
 
 * Extend the U2 worker/cache path for at least two physically different variants,
   explicit per-env assignment, role metadata, and goal-viz pairing.
 * `src/unisim/backend/subprocess_ipc/protocol.py` only for bounded dense/selected
-  payloads discovered by U2; no unprofiled tensor IPC.
-* New conformance tests covering env isolation, duplicate IDs, mixed masks,
-  body wrench accumulation/clear timing, collision filtering, cache hit/miss,
-  and native name permutation.
+  wrench payloads discovered by U2; no unprofiled tensor IPC.
+* New conformance tests covering env isolation, duplicate IDs, mixed complete
+  rows, body wrench accumulation/clear timing, collision filtering, cache
+  hit/miss, and native name permutation.
 
 U3 must provide real IsaacSim evidence for hammer+eraser (or equivalent
   dissimilar assets), but still does not open a SimToolReal route or SAPG gate.
@@ -617,16 +850,18 @@ is acceptable.
 
 Maintainers must decide before U1:
 
-1. Accept the graph as a public `SceneAssetGraph` contract versus a different
-   public name/module, and choose the schema/version negotiation policy.
-2. Approve the segment order for fixed-base and dynamic entities and whether
-   visual-only roots are included in default `get_state()`.
-3. Choose additive method names (`set_entity_state`, `apply_body_wrench`) and
-   whether selected-env interval ops should gain an `env_ids` field later.
+1. Accept the separate `GraphSceneCfg` plus `SceneAssetGraph` contract versus a
+   different public name/module, and choose the schema/version negotiation
+   policy.  Confirm the strict XOR with legacy `SceneCfg.model_file`.
+2. Approve descriptor-derived segment order and whether visual-only roots are
+   included in default `get_state()`.
+3. Confirm that existing complete-row `set_state`, `BackendRootStateLayout`,
+   global name APIs, `IntervalRandomizationPlan`, and dense `apply_body_force`
+   are the only runtime public operations required.
 4. Define the supported importer-profile registry and which profiles are
    guaranteed for URDF, USD, and legacy MJCF.
-5. Confirm that UniSim owns URDF→USD conversion/cache while task owners own
-   canonical manifests and URDF generation, including cache root policy.
+5. Confirm that task owners resolve and pass exactly one task cache root while
+   UniSim owns URDF→USD conversion/cache content, including cache validation.
 6. Set the IsaacSim/IsaacLab/PhysX support matrix and whether IsaacGym Preview
    4 remains a future implementation target.
 7. Decide whether reset/interval DR beyond force/torque is in U2/U3 or a later
@@ -639,6 +874,11 @@ Maintainers must decide before U1:
 * **Put URDF/USD paths into `ModelVariantSpec.source_model_file`.** Rejected:
   it violates the MJCF scanner contract, makes source format ambiguous, and
   breaks existing MuJoCo identity/tests.
+* **Make `SceneCfg.model_file` nullable and add an `asset_graph` field.**
+  Rejected for U1: it creates a two-source object with weak XOR validation and
+  invites legacy config adapters to run the MJCF scanner.  A sibling
+  `GraphSceneCfg` makes the input type and route explicit while preserving every
+  `SceneCfg(model_file=...)` caller.
 * **Keep a complete MJCF per object and convert 1200 full scenes.** Acceptable
   only for a small feasibility probe; it repeats robot conversion and still
   needs multi-actor state, reset, assignment, and wrench APIs.
@@ -646,8 +886,14 @@ Maintainers must decide before U1:
   Rejected as backend leakage and incompatible with future IsaacGym.
 * **Use `getattr`/`hasattr`, fallback, or swallowed exceptions to detect support.**
   Rejected; capability declarations and versioned validation must fail closed.
+* **Add `set_entity_state`, `apply_body_wrench`, or a new qualified resolver.**
+  Rejected after owner audit: `ResetStateTransaction` already merges complete
+  rows, `Entity.apply_body_wrench_to_sim` already densifies selected rows, and
+  existing global name APIs already cache public IDs.
 * **Force all entities into one virtual articulation.** Rejected: it loses
-  fixed-base versus dynamic-root semantics and makes object-only reset unsafe.
+  fixed-base versus dynamic-root semantics.  The graph instead derives one
+  complete global qpos/qvel row while retaining a root layout per floating
+  entity.
 * **Enable Fabric/physics replication for heterogeneous USD by default.**
   Rejected by the versioned IsaacSim config evidence; per-env physical prims are
   required until a native runtime proves another policy.
