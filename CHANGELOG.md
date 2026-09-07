@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0+simtoolreal.1 - 2026-09-07
+
+- Add the immutable backend-neutral `SceneAssetGraph` contract and deterministic
+  complete-row state layout for multi-entity scenes.
+- Add negotiated `scene-v2` subprocess metadata/slots, dense world-frame
+  wrench staging, selected complete-row reset, and IsaacSim graph materialization.
+- Add content-addressed URDF/USD cache validation and a real 2-env
+  robot/hammer/eraser/table/goal probe.
+- Pin the MuJoCo Uni runtime source to commit
+  `06359b9ac5d73d83ea22e72278d612b447406701` for reproducible closure.
+
 ## 1.1.3+simtoolreal.1 - 2026-09-07
 
 - Add MuJoCo startup model-source variants to `ModelVariantSpec`, compiled on

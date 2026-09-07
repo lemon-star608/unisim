@@ -12,6 +12,12 @@ Motrix, Drake, MJWarp, Genesis, IsaacGym, or IsaacSim without engine-specific
 branches. The base install depends only on NumPy; every engine SDK is an
 optional extra loaded lazily, and importing `unisim` never imports an engine.
 
+IsaacSim multi-entity scenes use the additive `GraphSceneCfg` /
+`SceneAssetGraph` contract. The graph is frozen and hashed on the cold path;
+the worker negotiates `scene-v2`, publishes a deterministic complete qpos/qvel
+layout, and keeps native prim/tensor indices private. Legacy
+`SceneCfg(model_file=...)` and its IPC protocol remain unchanged.
+
 ## Relationship to UniLab
 
 UniSim is the extracted, backend-neutral physics layer used by UniLab.
@@ -55,10 +61,10 @@ Construct a backend through the factory with a package-neutral `SceneCfg`:
 
 ```python
 backend = create_backend("mujoco", scene=scene_cfg, num_envs=64, sim_dt=0.01)
-backend.materialize()      # cold path: parse XML, build engine objects
+backend.materialize()  # cold path: parse XML, build engine objects
 backend.reset()
 state = backend.get_state()
-backend.step(ctrl)         # hot path: validated arrays, cached handles
+backend.step(ctrl)  # hot path: validated arrays, cached handles
 ```
 
 Each adapter fails closed with an actionable, backend-specific diagnostic
@@ -75,6 +81,11 @@ External worker roots can be configured with `UNISIM_ISAACGYM_HOME`,
 `UNISIM_ISAACGYM_PYTHON`, `UNISIM_ISAACSIM_HOME`, and
 `UNISIM_ISAACSIM_PYTHON`. The package also accepts the former `UNILAB_*`
 spellings as a migration fallback.
+
+For the real IsaacSim graph probe, set `UNISIM_ISAACSIM_PYTHON` to the pinned
+vendor interpreter and run `uv run python scripts/probe_isaacsim_graph.py`.
+The probe writes URDF/USD/cache data only below a temporary external directory;
+it does not claim 1200-tool, SAPG, or 6144/24576-environment support.
 
 ## Documentation
 

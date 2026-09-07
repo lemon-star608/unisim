@@ -9,12 +9,18 @@
 | Genesis | `unisim.GenesisBackend` | `uv sync --extra genesis` | available |
 | Newton | `unisim.NewtonBackend` | `uv sync --extra newton`, Newton 1.5.1 / MuJoCo-Warp 3.11.0 | available (CUDA) |
 | IsaacGym | `unisim.IsaacGymBackend` | `uv sync --extra isaacgym` (empty extra) + dedicated Python 3.8 worker | available |
-| IsaacSim | `unisim.IsaacSimBackend` | `uv sync --extra isaacsim` (empty extra) + dedicated IsaacSim/IsaacLab worker | available |
+| IsaacSim | `unisim.IsaacSimBackend` | `uv sync --extra isaacsim` (empty extra) + dedicated IsaacSim/IsaacLab worker | available (legacy + scene-v2 candidate; 2-env evidence) |
 
 The base wheel imports none of these SDKs. Construction performs cold-path
 runtime discovery and raises an adapter-specific, actionable error when the
 runtime is unavailable. The matrix is an adapter/API support statement, not a
 claim that every host has every vendor SDK or GPU capability.
+
+The scene-v2 candidate was exercised with IsaacSim `5.1.0.0`, IsaacLab
+`2.3.2.post1`, and PhysX profile `scene-v2-replicate-physics-false-v1` on an
+RTX 4090. See [`isaacsim-multi-entity-runtime.md`](isaacsim-multi-entity-runtime.md)
+for the exact command and explicit limits; no 1200-tool or large-capacity claim
+is implied.
 
 The MuJoCo-related extras share one version line (MuJoCo 3.11 / MuJoCo-Warp
 3.11 / warp-lang 1.16.0) and are jointly installable: `mjwarp` tracks the line

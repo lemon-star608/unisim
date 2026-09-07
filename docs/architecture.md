@@ -16,6 +16,19 @@ never escape the adapter. Drake, MJWarp and Genesis expose the same boundary
 through concrete engine adapters. IsaacGym and IsaacSim share the subprocess IPC
 framing and keep their Python 3.8/Kit workers outside the core wheel.
 
+Multi-entity IsaacSim scenes use the additive backend-neutral graph in
+`unisim.scene_assets`. `GraphSceneCfg` is a sibling of legacy
+`SceneCfg(model_file=...)`; the two routes are mutually exclusive. The graph is
+validated, hashed, and converted into contiguous complete qpos/qvel rows on the
+host cold path. Native USD prims, PhysX views, and per-environment assignment
+indices remain private to the worker. IsaacSim materializes URDF/USD variants
+under the caller-provided cache root with `replicate_physics=False` and
+`clone_in_fabric=False`.
+
+Cache publication uses a per-key exclusive lock with bounded waiting. The
+artifact and manifest are fsynced before atomic directory publication; a
+concurrent reader validates and reuses the completed entry.
+
 `unisim.ADAPTER_SPECS` is the single migration manifest for all eight UniLab
 backend identities. ``available`` means a public adapter and diagnostics exist;
 it does not claim that a proprietary SDK or GPU runtime is installed on every

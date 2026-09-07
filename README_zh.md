@@ -10,6 +10,11 @@ UniSim 提供后端中立的物理仿真契约（contract）和可选引擎适�
 IsaacGym 或 IsaacSim 之上。基础安装仅依赖 NumPy;所有引擎 SDK 都是懒加载的
 可选 extra,`import unisim` 不会导入任何引擎。
 
+IsaacSim 多实体场景使用新增的 `GraphSceneCfg` / `SceneAssetGraph` 契约。
+graph 在冷路径冻结并计算哈希；worker 协商 `scene-v2`，发布确定性的完整
+qpos/qvel 布局，并将原生 prim/tensor 索引保留在后端内部。旧的
+`SceneCfg(model_file=...)` 及其 IPC 协议保持不变。
+
 ## 与 UniLab 的关系
 
 UniSim 是从 UniLab 中抽取出来的、后端中立的物理层，供 UniLab 使用。UniLab
@@ -50,10 +55,10 @@ from unisim import SimBackend, create_backend
 
 ```python
 backend = create_backend("mujoco", scene=scene_cfg, num_envs=64, sim_dt=0.01)
-backend.materialize()      # 冷路径:解析 XML,构建引擎对象
+backend.materialize()  # 冷路径:解析 XML,构建引擎对象
 backend.reset()
 state = backend.get_state()
-backend.step(ctrl)         # 热路径:已校验数组与缓存句柄
+backend.step(ctrl)  # 热路径:已校验数组与缓存句柄
 ```
 
 当可选运行时缺失时,每个适配器都会给出后端专属、可操作的错误诊断——任何
@@ -67,6 +72,10 @@ benchmark 包保留的 schema 扩展点,本仓库不实现负载运行器。
 外部 worker 根目录可通过 `UNISIM_ISAACGYM_HOME`、`UNISIM_ISAACGYM_PYTHON`、
 `UNISIM_ISAACSIM_HOME`、`UNISIM_ISAACSIM_PYTHON` 配置。包同时兼容旧的
 `UNILAB_*` 拼写作为迁移回退。
+
+真实 IsaacSim graph 探针可将 `UNISIM_ISAACSIM_PYTHON` 指向固定的厂商解释器，
+然后运行 `uv run python scripts/probe_isaacsim_graph.py`。探针只在临时外部目录
+生成 URDF/USD/cache，不对 1200 工具、SAPG 或 6144/24576 环境作声明。
 
 ## 文档
 

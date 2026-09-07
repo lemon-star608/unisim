@@ -20,6 +20,13 @@ and resolve their vendor workers without importing Kit or Python 3.8 modules
 into the host process. Missing SDKs are reported at
 construction time; no backend is silently downgraded to another engine.
 
+For the IsaacSim multi-entity migration, task owners construct a validated
+`SceneAssetGraph` and pass it through `GraphSceneCfg`. This route never supplies
+`model_file` and therefore bypasses the legacy MJCF scanner. Existing
+`SceneCfg(model_file=...)` callers and the legacy subprocess protocol remain
+unchanged. See `isaacsim-multi-entity-runtime.md` for the candidate's real
+runtime evidence and explicit support limits.
+
 Runtime-owned caches and worker installations use the `UNISIM_*` environment
 variables and `~/.cache/unisim` defaults. The previous `UNILAB_*` names are
 accepted only as migration fallbacks so existing installations can move
