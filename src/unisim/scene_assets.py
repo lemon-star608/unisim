@@ -88,16 +88,21 @@ class AssetSource:
 
 @dataclass(frozen=True)
 class ImporterProfile:
-    """Named importer profile with immutable scalar options."""
+    """Named importer profile with immutable scalar options.
+
+    For per-joint drive gains, pass stiffness/damping as dict[str, float]:
+        options={"stiffness": {"joint_a": 500.0, "joint_b": 10.0}}
+    Scalar values apply to all joints (backward compatible default).
+    """
 
     name: str
-    options: Mapping[str, str | int | float | bool]
+    options: Mapping[str, str | int | float | bool | Mapping[str, float]]
 
     def __post_init__(self) -> None:
         _require_name(self.name, "ImporterProfile.name")
         if not isinstance(self.options, Mapping):
             raise TypeError("ImporterProfile.options must be a mapping")
-        normalized: dict[str, str | int | float | bool] = {}
+        normalized: dict[str, str | int | float | bool | Mapping[str, float]] = {}
         for key, value in self.options.items():
             _require_name(key, "ImporterProfile option name")
             if isinstance(value, bool):
@@ -106,9 +111,25 @@ class ImporterProfile:
                 if isinstance(value, float) and not math.isfinite(value):
                     raise ValueError(f"ImporterProfile option {key!r} must be finite")
                 normalized[key] = value
+            elif isinstance(value, Mapping):
+                # Per-joint dict for gains (e.g., stiffness/damping)
+                per_joint: dict[str, float] = {}
+                for joint_name, joint_value in value.items():
+                    _require_name(joint_name, f"ImporterProfile option {key!r} joint name")
+                    if not isinstance(joint_value, (int, float)):
+                        raise TypeError(
+                            f"ImporterProfile option {key!r} joint {joint_name!r} must be numeric"
+                        )
+                    if isinstance(joint_value, float) and not math.isfinite(joint_value):
+                        raise ValueError(
+                            f"ImporterProfile option {key!r} joint {joint_name!r} must be finite"
+                        )
+                    per_joint[joint_name] = float(joint_value)
+                normalized[key] = MappingProxyType(dict(sorted(per_joint.items())))
             else:
                 raise TypeError(
-                    f"ImporterProfile option {key!r} must be a scalar, got {type(value).__name__}"
+                    f"ImporterProfile option {key!r} must be a scalar or dict, "
+                    f"got {type(value).__name__}"
                 )
         object.__setattr__(self, "options", MappingProxyType(dict(sorted(normalized.items()))))
 
@@ -573,8 +594,17 @@ def _graph_hash(graph: SceneAssetGraph) -> str:
     return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
 
+def _json_default(obj: Any) -> Any:
+    """Custom JSON encoder for types that json.dumps doesn't natively support."""
+    if isinstance(obj, MappingProxyType):
+        return dict(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=_json_default
+    )
 
 
 def _segment_dict(segment: StateSegment) -> dict[str, Any]:

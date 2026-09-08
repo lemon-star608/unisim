@@ -351,10 +351,26 @@ class _WorkerContext:
                 if source["format"] == "urdf":
                     drive = None
                     if entity["kind"] == "articulation":
+                        # Extract stiffness/damping, handling scalar or per-joint dict
+                        stiffness_opt = options.get("stiffness", 100.0)
+                        damping_opt = options.get("damping", 10.0)
+
+                        # IsaacLab's UrdfConverter expects dict[str, float] | float
+                        stiffness_val = (
+                            dict(stiffness_opt)
+                            if isinstance(stiffness_opt, dict)
+                            else float(stiffness_opt)
+                        )
+                        damping_val = (
+                            dict(damping_opt)
+                            if isinstance(damping_opt, dict)
+                            else float(damping_opt)
+                        )
+
                         drive = UrdfConverterCfg.JointDriveCfg(
                             gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
-                                stiffness=float(options.get("stiffness", 100.0)),
-                                damping=float(options.get("damping", 10.0)),
+                                stiffness=stiffness_val,
+                                damping=damping_val,
                             )
                         )
                     converter = UrdfConverter(
@@ -478,14 +494,40 @@ class _WorkerContext:
                         actuators={
                             "all": ImplicitActuatorCfg(
                                 joint_names_expr=[".*"],
-                                stiffness=float(
-                                    entity["variants"][0]["importer"]["options"].get(
-                                        "stiffness", 100.0
+                                stiffness=(
+                                    dict(
+                                        entity["variants"][0]["importer"]["options"].get(
+                                            "stiffness", 100.0
+                                        )
+                                    )
+                                    if isinstance(
+                                        entity["variants"][0]["importer"]["options"].get(
+                                            "stiffness", 100.0
+                                        ),
+                                        dict,
+                                    )
+                                    else float(
+                                        entity["variants"][0]["importer"]["options"].get(
+                                            "stiffness", 100.0
+                                        )
                                     )
                                 ),
-                                damping=float(
-                                    entity["variants"][0]["importer"]["options"].get(
-                                        "damping", 10.0
+                                damping=(
+                                    dict(
+                                        entity["variants"][0]["importer"]["options"].get(
+                                            "damping", 10.0
+                                        )
+                                    )
+                                    if isinstance(
+                                        entity["variants"][0]["importer"]["options"].get(
+                                            "damping", 10.0
+                                        ),
+                                        dict,
+                                    )
+                                    else float(
+                                        entity["variants"][0]["importer"]["options"].get(
+                                            "damping", 10.0
+                                        )
                                     )
                                 ),
                             )
