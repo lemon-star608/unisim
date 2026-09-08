@@ -174,21 +174,60 @@ def main() -> None:
                 )
                 after = backend.get_state()
                 assert np.array_equal(after["qpos"][0], before["qpos"][0])
+                assert np.array_equal(after["qvel"][0], before["qvel"][0])
+                object_layout = layout.entities[1]
+                object_qpos = set(object_layout.root.qpos_indices)
+                object_qvel = set(object_layout.root.qvel_indices)
+                other_qpos = [i for i in range(layout.qpos_width) if i not in object_qpos]
+                other_qvel = [i for i in range(layout.qvel_width) if i not in object_qvel]
+                np.testing.assert_allclose(
+                    after["qpos"][1, other_qpos], before["qpos"][1, other_qpos], atol=1e-6
+                )
+                np.testing.assert_allclose(
+                    after["qvel"][1, other_qvel], before["qvel"][1, other_qvel], atol=1e-6
+                )
+
+                # Put both object variants at rest, then apply identical accumulated
+                # wrenches.  The 0.2 kg eraser must accelerate faster than the 1 kg
+                # hammer; a following unstaged step proves the wrench was cleared.
+                reset = backend.get_state()
+                zero_velocity = reset["qvel"].copy()
+                zero_velocity[:, object_layout.root.qvel_indices] = 0.0
+                backend.set_state(np.array([0, 1]), reset["qpos"], zero_velocity)
                 object_body = backend.get_body_ids(["object_root"])
                 force = np.zeros((2, 1, 3), dtype=np.float32)
-                force[1, 0, 2] = 2.0
+                force[:, 0, 0] = 1.0
                 torque = np.zeros_like(force)
-                torque[1, 0, 2] = 0.5
+                torque[:, 0, 2] = 0.25
+                velocity_before = backend.get_body_lin_vel_w(object_body).copy()
                 backend.apply_body_force(object_body, force, torque=torque)
+                backend.apply_body_force(object_body, force, torque=torque)
+                np.testing.assert_array_equal(backend._slots["force"][:, object_body, :], 2 * force)
+                np.testing.assert_array_equal(
+                    backend._slots["torque"][:, object_body, :], 2 * torque
+                )
                 backend.step(np.zeros((2, backend.num_actuators), dtype=np.float32))
                 lin_vel = backend.get_body_lin_vel_w(object_body)
                 ang_vel = backend.get_body_ang_vel_w(object_body)
                 assert np.isfinite(lin_vel).all() and np.isfinite(ang_vel).all()
-                assert float(lin_vel[1, 0, 2]) > float(lin_vel[0, 0, 2]) + 1e-6
-                assert abs(float(ang_vel[1, 0, 2])) > abs(float(ang_vel[0, 0, 2])) + 1e-6
+                delta_vx = lin_vel[:, 0, 0] - velocity_before[:, 0, 0]
+                assert float(delta_vx[1]) > 2.5 * float(delta_vx[0]) > 0.0
+                assert np.all(np.abs(ang_vel[:, 0, 2]) > 1e-5)
+                assert np.count_nonzero(backend._slots["force"]) == 0
+                assert np.count_nonzero(backend._slots["torque"]) == 0
+                velocity_after_force = lin_vel.copy()
+                backend.step(np.zeros((2, backend.num_actuators), dtype=np.float32))
+                velocity_after_clear = backend.get_body_lin_vel_w(object_body)
+                clear_delta_vx = velocity_after_clear[:, 0, 0] - velocity_after_force[:, 0, 0]
+                assert np.all(np.abs(clear_delta_vx) < np.maximum(np.abs(delta_vx) * 0.2, 1e-5))
+                final_state = backend.get_state(("qpos", "qvel", "ctrl"))
+                assert all(np.isfinite(values).all() for values in final_state.values())
                 print(
-                    "selected_reset_isolated=True wrench_step_finite=True "
-                    f"env1_dvz={lin_vel[1, 0, 2]:.6g} env1_dwz={ang_vel[1, 0, 2]:.6g}"
+                    "selected_reset_isolated=True same_env_entities_isolated=True "
+                    "wrench_accumulated=True wrench_cleared=True "
+                    f"hammer_dvx={delta_vx[0]:.6g} eraser_dvx={delta_vx[1]:.6g} "
+                    f"hammer_dwz={ang_vel[0, 0, 2]:.6g} "
+                    f"eraser_dwz={ang_vel[1, 0, 2]:.6g}"
                 )
             finally:
                 backend.close()

@@ -4,11 +4,12 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from unisim.backend.isaacsim import assets as asset_cache
 from unisim.backend.isaacsim.assets import AssetCacheKey, materialize_cached_asset
-from unisim.backend.isaacsim.worker import _resolve_graph_cache_root
+from unisim.backend.isaacsim.worker import _resolve_graph_cache_root, _scatter_public_wrench
 
 
 def _key() -> AssetCacheKey:
@@ -34,6 +35,15 @@ def test_graph_cache_root_accepts_null_default_and_absolute_override(
     assert _resolve_graph_cache_root(str(explicit)) == str(explicit)
     with pytest.raises(ValueError, match="absolute or null"):
         _resolve_graph_cache_root("relative")
+
+
+def test_public_wrench_is_scattered_to_native_body_order() -> None:
+    public = np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=np.float32)
+    native = _scatter_public_wrench(public, [2, 0], 4)
+    np.testing.assert_array_equal(native[:, 2], public[:, 0])
+    np.testing.assert_array_equal(native[:, 0], public[:, 1])
+    np.testing.assert_array_equal(native[:, 1], 0.0)
+    np.testing.assert_array_equal(native[:, 3], 0.0)
 
 
 def test_cache_miss_hit_and_corruption_rebuild(tmp_path: Path) -> None:

@@ -85,6 +85,21 @@ def _resolve_graph_cache_root(value: Any) -> str:
     return value
 
 
+def _scatter_public_wrench(
+    values: np.ndarray, native_indices: list[int], native_body_count: int
+) -> np.ndarray:
+    """Scatter one entity's public body rows into its native body order."""
+    if values.ndim != 3 or values.shape[1] != len(native_indices) or values.shape[2] != 3:
+        raise ValueError("public wrench rows do not match the resolved body permutation")
+    if len(set(native_indices)) != len(native_indices) or any(
+        index < 0 or index >= native_body_count for index in native_indices
+    ):
+        raise ValueError("resolved native body permutation is invalid")
+    native = np.zeros((values.shape[0], native_body_count, 3), dtype=np.float32)
+    native[:, native_indices, :] = values
+    return native
+
+
 def _canonical_graph_hash(graph: dict[str, Any]) -> str:
     content = {
         "schema_version": graph["schema_version"],
@@ -182,6 +197,7 @@ class _WorkerContext:
         self.graph_entities: dict[str, Any] = {}
         self.graph_root_segments: dict[str, tuple[list[int], list[int]]] = {}
         self.graph_body_native_indices: dict[str, list[int]] = {}
+        self.graph_native_body_counts: dict[str, int] = {}
         self.cache_hits: dict[str, list[bool]] = {}
 
     # ------------------------------------------------------------------
@@ -498,6 +514,7 @@ class _WorkerContext:
                 native_bodies.append(binding["source_name"])
                 native_indices.append(native_ids[binding["source_name"]])
             self.graph_body_native_indices[entity["name"]] = native_indices
+            self.graph_native_body_counts[entity["name"]] = len(native)
         self.contract_body_names = public_bodies
         self.native_body_names = native_bodies
         if self.robot is not None:
@@ -1093,9 +1110,19 @@ class _WorkerContext:
             obj = self.graph_entities[entity["name"]]
             values_f = force[:, body_cursor : body_cursor + count, :]
             values_t = torque[:, body_cursor : body_cursor + count, :]
+            native_indices = self.graph_body_native_indices[entity["name"]]
+            native_count = self.graph_native_body_counts[entity["name"]]
             obj.set_external_force_and_torque(
-                _to_tensor(self.torch, values_f, self.device),
-                _to_tensor(self.torch, values_t, self.device),
+                _to_tensor(
+                    self.torch,
+                    _scatter_public_wrench(values_f, native_indices, native_count),
+                    self.device,
+                ),
+                _to_tensor(
+                    self.torch,
+                    _scatter_public_wrench(values_t, native_indices, native_count),
+                    self.device,
+                ),
                 is_global=True,
             )
             body_cursor += count
