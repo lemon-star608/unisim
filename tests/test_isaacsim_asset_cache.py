@@ -9,7 +9,11 @@ import pytest
 
 from unisim.backend.isaacsim import assets as asset_cache
 from unisim.backend.isaacsim.assets import AssetCacheKey, materialize_cached_asset
-from unisim.backend.isaacsim.worker import _resolve_graph_cache_root, _scatter_public_wrench
+from unisim.backend.isaacsim.worker import (
+    _resolve_graph_cache_root,
+    _scatter_public_wrench,
+    _validate_graph_articulation_topology,
+)
 
 
 def _key() -> AssetCacheKey:
@@ -44,6 +48,21 @@ def test_public_wrench_is_scattered_to_native_body_order() -> None:
     np.testing.assert_array_equal(native[:, 0], public[:, 1])
     np.testing.assert_array_equal(native[:, 1], 0.0)
     np.testing.assert_array_equal(native[:, 3], 0.0)
+
+
+def test_worker_rejects_non_single_articulation_before_runtime_start() -> None:
+    _validate_graph_articulation_topology(
+        [{"name": "robot", "kind": "articulation"}, {"name": "tool", "kind": "rigid"}]
+    )
+    with pytest.raises(NotImplementedError, match="exactly one articulation; found 0"):
+        _validate_graph_articulation_topology([{"name": "tool", "kind": "rigid"}])
+    with pytest.raises(NotImplementedError, match="exactly one articulation; found 2"):
+        _validate_graph_articulation_topology(
+            [
+                {"name": "left", "kind": "articulation"},
+                {"name": "right", "kind": "articulation"},
+            ]
+        )
 
 
 def test_cache_miss_hit_and_corruption_rebuild(tmp_path: Path) -> None:
@@ -125,4 +144,10 @@ def test_concurrent_writer_waits_and_reuses_atomic_publish(
 def test_cache_version_change_has_distinct_identity() -> None:
     one = _key()
     two = AssetCacheKey(**{**one.__dict__, "isaacsim_version": "5.2.0"})
+    assert one.digest() != two.digest()
+
+
+def test_importer_profile_change_has_distinct_identity() -> None:
+    one = _key()
+    two = AssetCacheKey(**{**one.__dict__, "importer_profile": "visual-goal"})
     assert one.digest() != two.digest()

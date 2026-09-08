@@ -110,6 +110,24 @@ def _canonical_graph_hash(graph: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_graph_articulation_topology(entities: Any) -> None:
+    """Fail before Kit startup when the graph exceeds this worker's topology."""
+    if not isinstance(entities, list) or not entities:
+        raise ValueError("scene-v2 graph must contain entities")
+    if any(not isinstance(entity, dict) for entity in entities):
+        raise TypeError("scene-v2 graph entities must be mappings")
+    articulation_names = [
+        str(entity.get("name", "<unnamed>"))
+        for entity in entities
+        if entity.get("kind") == "articulation"
+    ]
+    if len(articulation_names) != 1:
+        raise NotImplementedError(
+            "isaacsim graph runtime requires exactly one articulation; "
+            f"found {len(articulation_names)}: {articulation_names}"
+        )
+
+
 def _resolve_articulation_root_prim_path(usd_path: str, root_name: str) -> str:
     """Resolve the imported articulation root relative to the asset prim.
 
@@ -220,8 +238,7 @@ class _WorkerContext:
         if int(graph.get("num_envs", 0)) != int(payload.get("num_envs", 0)):
             raise ValueError("scene-v2 graph num_envs does not match INIT num_envs")
         entities = graph.get("entities")
-        if not isinstance(entities, list) or not entities:
-            raise ValueError("scene-v2 graph must contain entities")
+        _validate_graph_articulation_topology(entities)
 
         os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "1")
         self.graph_mode = True

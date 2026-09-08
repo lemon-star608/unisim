@@ -8,12 +8,13 @@ and cache hit reporting.  Generated files never live in the repository.
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
-from unisim import create_backend
+from unisim import BackendCapability, create_backend
 from unisim.scene_assets import (
     AssetSource,
     EntityDescriptor,
@@ -158,7 +159,9 @@ def main() -> None:
                 worker_timeout_s=180,
             )
             try:
+                assert BackendCapability.GRAPH_SCENE in backend.capabilities
                 backend.materialize()
+                assert BackendCapability.GRAPH_SCENE in backend.capabilities
                 print(
                     f"run={run} model={backend.model} cache_hits={backend._cache_hits} "
                     f"runtime_versions={backend._runtime_versions}"
@@ -231,6 +234,38 @@ def main() -> None:
                 )
             finally:
                 backend.close()
+
+        # Exercise the public GraphSceneCfg(graph) route without an explicit
+        # cache root. Keep its documented ~/.cache/unisim default inside this
+        # probe's external temporary directory.
+        default_home = root_path / "default-home"
+        default_home.mkdir()
+        previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(default_home)
+        try:
+            default_backend = create_backend(
+                "isaacsim",
+                scene=GraphSceneCfg(graph),
+                num_envs=2,
+                sim_dt=1.0 / 120.0,
+                worker_timeout_s=180,
+            )
+            try:
+                assert BackendCapability.GRAPH_SCENE in default_backend.capabilities
+                default_backend.materialize()
+                assert BackendCapability.GRAPH_SCENE in default_backend.capabilities
+                assert (default_home / ".cache" / "unisim").is_dir()
+                print(
+                    "default_cache_root_route=True "
+                    f"cache_hits={default_backend._cache_hits}"
+                )
+            finally:
+                default_backend.close()
+        finally:
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
 
 
 if __name__ == "__main__":

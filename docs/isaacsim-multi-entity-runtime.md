@@ -34,6 +34,9 @@ the 1 kg hammer changed x velocity by 0.0166667 m/s and the 0.2 kg eraser by
 0.0833333 m/s. The first run reported misses for every role/variant conversion;
 the second run reported hits for every entry. Object and visual-goal variants
 have distinct cache identities because their conversion roles differ.
+A third materialization omitted `cache_root`, exercised the documented
+`~/.cache/unisim` default inside the probe's temporary HOME, and completed with
+the graph capability unchanged before and after materialization.
 
 Generated URDF, USD, cache, and logs were outside the repository. No SimToolReal
 or UniLab source, site-packages, or dirty working-tree files were modified.
@@ -44,3 +47,5 @@ The evidence is limited to this two-environment synthetic probe. It does not
 claim SimToolReal Kuka 29-joint parity, a 1200-tool pool, SAPG training or
 checkpoint restore, or 6144/24576-environment capacity. Those remain downstream
 gates requiring their owner repositories and dedicated runtime evidence.
+The IsaacSim graph capability currently requires exactly one articulation;
+zero- and multi-articulation graphs fail before worker launch/Kit mutation.

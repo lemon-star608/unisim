@@ -19,6 +19,7 @@ class BackendCapability(str, Enum):
     STATE_READ = "state_read"
     STATE_WRITE = "state_write"
     MUTATION = "mutation"
+    GRAPH_SCENE = "graph_scene"
 
 
 __all__ = ["BackendCapability", "BackendError", "UnsupportedCapabilityError"]

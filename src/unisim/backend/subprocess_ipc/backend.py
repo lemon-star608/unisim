@@ -41,6 +41,7 @@ from unisim.dr.types import (
     DomainRandomizationCapabilities,
     ResetRandomizationPayload,
 )
+from unisim.errors import BackendCapability
 from unisim.scene import SceneCfg
 from unisim.scene_assets import (
     GraphSceneCfg,
@@ -214,6 +215,13 @@ class MjcfSubprocessBackend(SimBackend):
     _BACKEND_LABEL = "subprocess"
     _WORKER_ERROR_CLS: type[SubprocessWorkerError] = SubprocessWorkerError
     _MODEL_INFO_CLS: type[SubprocessModelInfo] = SubprocessModelInfo
+
+    @property
+    def capabilities(self):
+        capabilities = set(super().capabilities)
+        if self._graph_mode:
+            capabilities.add(BackendCapability.GRAPH_SCENE)
+        return frozenset(capabilities)
 
     def _worker_error(self, message: str, **kwargs: Any) -> SubprocessWorkerError:
         """Construct the concrete adapter's public worker error type."""

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
-from unisim import create_backend
+from unisim import BackendCapability, create_backend
+from unisim.scene import SceneCfg
 from unisim.scene_assets import (
     AssetSource,
     EntityDescriptor,
@@ -132,3 +135,38 @@ def test_graph_scene_cfg_has_no_legacy_model_file_and_requires_absolute_cache() 
         GraphSceneCfg(_graph(), cache_root="relative-cache")
     with pytest.raises(ValueError, match="only by the isaacsim"):
         create_backend("fake", scene=scene)
+
+
+def test_graph_backend_advertises_graph_capabilities() -> None:
+    backend = create_backend("isaacsim", scene=GraphSceneCfg(_graph()), num_envs=2, sim_dt=0.01)
+    try:
+        assert BackendCapability.GRAPH_SCENE in backend.capabilities
+    finally:
+        backend.close()
+
+
+def test_legacy_isaacsim_does_not_advertise_graph_capability() -> None:
+    backend = create_backend(
+        "isaacsim", scene=SceneCfg(model_file="unused.xml"), num_envs=2, sim_dt=0.01
+    )
+    try:
+        assert BackendCapability.GRAPH_SCENE not in backend.capabilities
+    finally:
+        backend.close()
+
+
+def test_isaacsim_graph_rejects_unsupported_articulation_counts_before_worker() -> None:
+    graph = _graph()
+    no_robot = SceneAssetGraph(1, 2, (graph.entities[1],))
+    with pytest.raises(NotImplementedError, match="exactly one articulation; found 0"):
+        create_backend("isaacsim", scene=GraphSceneCfg(no_robot), num_envs=2, sim_dt=0.01)
+
+    second_robot = replace(
+        graph.entities[0],
+        name="robot2",
+        joint_bindings=(NameBinding("robot2_joint", "joint"),),
+        body_bindings=(NameBinding("robot2_palm", "palm"),),
+    )
+    two_robots = SceneAssetGraph(1, 2, (*graph.entities, second_robot))
+    with pytest.raises(NotImplementedError, match="exactly one articulation; found 2"):
+        create_backend("isaacsim", scene=GraphSceneCfg(two_robots), num_envs=2, sim_dt=0.01)

@@ -31,6 +31,7 @@ from unisim.backend.subprocess_ipc.sensors import (
     KIND_CONTACT_FOUND,
     UnsupportedSensorSpec,
 )
+from unisim.scene_assets import GraphSceneCfg
 
 from .dependencies import build_worker_env, resolve_isaacsim_runtime
 
@@ -92,6 +93,15 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         render_height: int = 720,
         **kwargs: Any,
     ) -> None:
+        if isinstance(scene, GraphSceneCfg):
+            articulation_names = [
+                entity.name for entity in scene.graph.entities if entity.kind == "articulation"
+            ]
+            if len(articulation_names) != 1:
+                raise NotImplementedError(
+                    "isaacsim graph runtime requires exactly one articulation; "
+                    f"found {len(articulation_names)}: {articulation_names}"
+                )
         mode = None if render_mode is None else normalize_play_render_mode(render_mode)
         for name, value in (("render_width", render_width), ("render_height", render_height)):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
