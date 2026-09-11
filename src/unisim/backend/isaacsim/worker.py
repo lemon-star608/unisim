@@ -235,15 +235,71 @@ class _WorkerContext:
         enable_extension("isaacsim.asset.importer.mjcf")
 
         model_file = os.fspath(payload["model_file"])
-        converter = MjcfConverter(
-            MjcfConverterCfg(
-                asset_path=model_file,
-                fix_base=False,
-                import_sites=True,
-                make_instanceable=True,
-                self_collision=False,
+        self._fixed_base = bool(payload.get("fixed_base", False))
+        if model_file.lower().endswith(".urdf"):
+            # SimToolReal step-0 URDF entry: same converter and flags family as
+            # the original repository's scene_utils.py:_convert_urdf_to_usd
+            # (zero-gain force position drives so ImplicitActuator owns gains).
+            enable_extension("isaacsim.asset.importer.urdf")
+            from isaaclab.sim.converters import (  # type: ignore[import-not-found]
+                UrdfConverter,
+                UrdfConverterCfg,
             )
-        )
+
+            converter = UrdfConverter(
+                UrdfConverterCfg(
+                    asset_path=model_file,
+                    fix_base=self._fixed_base,
+                    merge_fixed_joints=bool(payload.get("urdf_merge_fixed_joints", True)),
+                    self_collision=bool(payload.get("urdf_self_collision", False)),
+                    joint_drive=UrdfConverterCfg.JointDriveCfg(
+                        drive_type="force",
+                        target_type="position",
+                        gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+                            stiffness=0.0, damping=0.0
+                        ),
+                    ),
+                )
+            )
+        else:
+            converter = MjcfConverter(
+                MjcfConverterCfg(
+                    asset_path=model_file,
+                    fix_base=False,
+                    import_sites=True,
+                    make_instanceable=True,
+                    self_collision=False,
+                )
+            )
+
+        if model_file.lower().endswith(".urdf"):
+            # The URDF converter emits RigidBody prims but no
+            # ArticulationRootAPI (the original repository applies it in its
+            # bake step, scene_utils.py:1461-1539).  Apply it on the named root
+            # link here so the articulation root resolution below succeeds.
+            from pxr import Usd, UsdPhysics  # type: ignore[import-not-found]
+
+            urdf_root_name = str(payload.get("root_body_name") or "")
+            if not urdf_root_name:
+                raise ValueError(
+                    "isaacsim URDF INIT requires root_body_name for the "
+                    "articulation-root patch"
+                )
+            stage = Usd.Stage.Open(str(converter.usd_path))
+            default_path = str(stage.GetDefaultPrim().GetPath()).rstrip("/")
+            matches = [
+                prim
+                for prim in stage.Traverse()
+                if str(prim.GetPath()).rsplit("/", 1)[-1] == urdf_root_name
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"isaacsim URDF articulation root patch expected exactly one prim "
+                    f"named {urdf_root_name!r} below {default_path!r}, found "
+                    f"{[str(prim.GetPath()) for prim in matches] or '<none>'}"
+                )
+            UsdPhysics.ArticulationRootAPI.Apply(matches[0])
+            stage.GetRootLayer().Save()
 
         # Build a deterministic environment grid.  The USD importer owns the
         # robot hierarchy; only these Xforms and the articulation wrapper are
@@ -494,11 +550,12 @@ class _WorkerContext:
         native_pos[:, self.native_joint_for_contract] = qpos[7:][None, :]
         joint_pos = _to_tensor(self.torch, native_pos, self.device)
         joint_vel = self.torch.zeros_like(joint_pos)
-        self.robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
-        # UniLab's root state is the link-frame state.  IsaacLab's similarly
-        # named ``write_root_velocity_to_sim`` targets the COM frame, so use
-        # the explicit link writer here.
-        self.robot.write_root_link_velocity_to_sim(root_vel, env_ids=env_ids)
+        if not self._fixed_base:
+            self.robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+            # UniLab's root state is the link-frame state.  IsaacLab's similarly
+            # named ``write_root_velocity_to_sim`` targets the COM frame, so use
+            # the explicit link writer here.
+            self.robot.write_root_link_velocity_to_sim(root_vel, env_ids=env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.robot.reset(env_ids)
         self.robot.update(self.sim_dt)
@@ -599,20 +656,21 @@ class _WorkerContext:
         if qvel.shape != expected_qvel:
             raise ValueError(f"reset qvel has shape {qvel.shape}; expected {expected_qvel}")
         env_ids = self.torch.as_tensor(env_ids_np, dtype=self.torch.long, device=self.device)
-        root_pose_np = qpos[:, :7].copy()
-        root_pose_np[:, :3] += self.env_origins[env_ids_np]
-        root_pose = _to_tensor(self.torch, root_pose_np, self.device)
-        root_velocity_np = np.empty((count, 6), dtype=np.float32)
-        root_velocity_np[:, :3] = qvel[:, :3]
-        root_velocity_np[:, 3:] = _quat_rotate_wxyz(qpos[:, 3:7], qvel[:, 3:6])
         native_pos = np.zeros((count, self.num_dof), dtype=np.float32)
         native_vel = np.zeros_like(native_pos)
         native_pos[:, self.native_joint_for_contract] = qpos[:, 7 : 7 + self.num_dof]
         native_vel[:, self.native_joint_for_contract] = qvel[:, 6 : 6 + self.num_dof]
-        self.robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
-        self.robot.write_root_link_velocity_to_sim(
-            _to_tensor(self.torch, root_velocity_np, self.device), env_ids=env_ids
-        )
+        if not self._fixed_base:
+            root_pose_np = qpos[:, :7].copy()
+            root_pose_np[:, :3] += self.env_origins[env_ids_np]
+            root_pose = _to_tensor(self.torch, root_pose_np, self.device)
+            root_velocity_np = np.empty((count, 6), dtype=np.float32)
+            root_velocity_np[:, :3] = qvel[:, :3]
+            root_velocity_np[:, 3:] = _quat_rotate_wxyz(qpos[:, 3:7], qvel[:, 3:6])
+            self.robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+            self.robot.write_root_link_velocity_to_sim(
+                _to_tensor(self.torch, root_velocity_np, self.device), env_ids=env_ids
+            )
         self.robot.write_joint_state_to_sim(
             _to_tensor(self.torch, native_pos, self.device),
             _to_tensor(self.torch, native_vel, self.device),

@@ -26,6 +26,20 @@
 - **Breaking (mujoco):** per-env model variants are no longer supported (`apply_init_randomization` model-variant plans now fail closed via the base class); field-level reset randomization uses mjbatch `expand` views + `set_const` (lazy first expansion allocates one model copy per worker thread, so DR tasks pay `nthread x model` memory instead of `num_envs x model`). `get_physics_state` snapshots are exactly `[time, qpos, qvel]` per row (the old rows carried a FULLPHYSICS tail), which also fixes the previous length mismatch for `na > 0` models in the offline render workers. Height scanning and site Jacobians run as mjbatch query ops on the live state; query ops skip the bound-field CopyOut, so the bound views are untouched by the calls. The height scanner is `output="height"`-only on this backend and passes `alignment` through to mjbatch (`"world"`/`"yaw"`).
 - **Breaking (mujoco):** `post_step_forward_sensor` is removed end to end (its only `True` behavior is unreachable on the new executor); the chunk tuner is deleted entirely (`chunk_size`/`adaptive_chunk_size` are warn-and-ignore `DeprecationWarning` shims at the factory, and `bench_nsteps` is accepted and ignored by the factory). Models with `sleep` enabled now fail fast at `Batch` construction.
 - Playback model resolution no longer maps per-env variant geom sizes: one visual model file (or one saved mjb) serves every rendered env, and `materialize_visual_playback_model` is removed from the mujoco package exports.
+## Unreleased
+
+- **IsaacSim adapter: minimal URDF scene entry (SimToolReal step 0).**
+  `scene.model_file` may now point to a `.urdf`: the worker dispatches to
+  Isaac Lab's `UrdfConverter` (payload-controlled `fix_base`,
+  `urdf_self_collision`, `urdf_merge_fixed_joints`; zero-gain force position
+  drives so the runtime ImplicitActuator layer owns gains) and patches the
+  converted USD with `ArticulationRootAPI` on the named root link (the URDF
+  converter emits only RigidBody prims).  The host metadata scan gains a URDF
+  branch reporting links/movable joints/limits and synthesizing zero-gain
+  position actuators, replicating `merge_fixed_joints` semantics so the
+  host/worker name handshake holds.  INIT carries a `fixed_base` flag; the
+  worker skips root pose/velocity writes for fixed-base articulations.
+  MJCF behaviour is unchanged.
 
 ## 1.2.0 - 2026-09-10
 
