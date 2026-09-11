@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **IsaacSim adapter: minimal URDF scene entry (SimToolReal step 0).**
+  `scene.model_file` may now point to a `.urdf`: the worker dispatches to
+  Isaac Lab's `UrdfConverter` (payload-controlled `fix_base`,
+  `urdf_self_collision`, `urdf_merge_fixed_joints`; zero-gain force position
+  drives so the runtime ImplicitActuator layer owns gains) and patches the
+  converted USD with `ArticulationRootAPI` on the named root link (the URDF
+  converter emits only RigidBody prims).  The host metadata scan gains a URDF
+  branch reporting links/movable joints/limits and synthesizing zero-gain
+  position actuators, replicating `merge_fixed_joints` semantics so the
+  host/worker name handshake holds.  INIT carries a `fixed_base` flag; the
+  worker skips root pose/velocity writes for fixed-base articulations.
+  MJCF behaviour is unchanged.
+
 ## 1.2.0 - 2026-09-10
 
 - Promote the current contract and adapter surface to the `1.2.x` line. No

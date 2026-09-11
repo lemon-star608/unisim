@@ -401,6 +401,11 @@ class MjcfSubprocessBackend(SimBackend):
                     "num_envs": self._num_envs,
                     "sim_dt": self._sim_dt,
                     "device_id": self._device_id,
+                    # Fixed-base scenes (no free joint in the metadata scan)
+                    # must not write root pose/velocity; URDF inputs always take
+                    # this branch in step 0 (the fix/float choice is a converter
+                    # flag, not URDF content).
+                    "fixed_base": self._get_scene_metadata().freejoint_body_name is None,
                     **runtime_payload,
                     **worker_init_payload,
                     "root_body_name": self._base_name

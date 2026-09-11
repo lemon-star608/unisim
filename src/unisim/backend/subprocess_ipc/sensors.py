@@ -545,11 +545,13 @@ def scan_scene_metadata(model_file: str, *, backend_label: str = "subprocess") -
     """Scan one MJCF scene (with includes) for sensors and keyframes.
 
     Cold path only: this reads and parses asset XML and must never run on
-    step/reset hot paths.
+    step/reset hot paths.  ``.urdf`` inputs take the URDF branch below.
     """
     path = Path(model_file).expanduser()
     if not path.is_file():
         raise ValueError(f"{backend_label} scene model file does not exist: {path}")
+    if path.suffix.lower() == ".urdf":
+        return _scan_urdf_metadata(path, backend_label)
     raw: dict = {
         "site_frames": {},
         "site_attrs": {},
@@ -612,6 +614,79 @@ def scan_scene_metadata(model_file: str, *, backend_label: str = "subprocess") -
         joint_ranges=tuple(raw["joint_ranges"]),
         joint_armature=tuple(raw["joint_armature"]),
         joint_frictionloss=tuple(raw["joint_frictionloss"]),
+    )
+
+
+def _scan_urdf_metadata(path: Path, backend_label: str) -> SceneMetadata:
+    """Minimal URDF branch of the scene metadata scan (SimToolReal step 0).
+
+    URDF carries links/joints but no sensors, keyframes, or actuator gains, so
+    this branch reports names and joint limits and synthesizes one zero-gain
+    ``<position>``-equivalent actuator per non-fixed joint (real PD gains are
+    owner-config work; see the SimToolReal DESIGN.md actuator notes).  The
+    fixed/floating choice is a converter flag, not URDF content, so
+    ``freejoint_body_name`` stays ``None`` here and the worker applies
+    ``fix_base`` from the INIT payload.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"failed to parse URDF file {path}: {exc}") from exc
+    if root.tag != "robot":
+        raise ValueError(f"{backend_label} expected a URDF <robot> document in {path}")
+
+    links = [str(link.get("name")) for link in root.iter("link") if link.get("name")]
+    # The worker converts with merge_fixed_joints=True (matching the original
+    # repository), which absorbs fixed-joint child links into their parent;
+    # the merged names disappear from the articulation's native body list.
+    # Replicate that here so the host/worker body-name contract matches.
+    merged: set[str] = set()
+    for joint in root.iter("joint"):
+        if joint.get("type") != "fixed":
+            continue
+        child = joint.find("child")
+        if child is not None and child.get("link"):
+            merged.add(str(child.get("link")))
+    body_names = [name for name in links if name not in merged]
+
+    joint_names: list[str] = []
+    joint_ranges: list[tuple[float, float]] = []
+    actuators: list[ActuatorSpec] = []
+    for joint in root.iter("joint"):
+        name = joint.get("name")
+        jtype = joint.get("type")
+        if not name or jtype in (None, "fixed"):
+            continue
+        if jtype not in ("revolute", "prismatic", "continuous"):
+            raise NotImplementedError(
+                f"{backend_label} URDF branch supports revolute/prismatic/continuous "
+                f"joints only; found {jtype!r} on joint {name!r} (file: {path})"
+            )
+        joint_names.append(name)
+        limit = joint.find("limit")
+        lower = float(limit.get("lower", "-inf")) if limit is not None else -np.inf
+        upper = float(limit.get("upper", "inf")) if limit is not None else np.inf
+        joint_ranges.append((lower, upper))
+        effort = float(limit.get("effort")) if limit is not None and limit.get("effort") else None
+        actuators.append(
+            ActuatorSpec(
+                name=name,
+                joint_name=name,
+                kp=0.0,
+                kv=0.0,
+                forcerange=None if effort is None else (-effort, effort),
+                ctrlrange=(lower, upper) if np.isfinite([lower, upper]).all() else None,
+            )
+        )
+    return SceneMetadata(
+        model_file=str(path),
+        joint_names=tuple(joint_names),
+        body_names=tuple(body_names),
+        freejoint_body_name=None,
+        actuators=tuple(actuators),
+        joint_ranges=tuple(joint_ranges),
+        joint_armature=tuple(0.0 for _ in joint_names),
+        joint_frictionloss=tuple(0.0 for _ in joint_names),
     )
 
 
