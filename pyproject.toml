@@ -75,6 +75,13 @@ isaacsim = []
 [dependency-groups]
 dev = ["pytest", "ruff", "mypy"]
 
+[tool.uv.sources]
+# SimToolReal development (workspace redo-simtoolreal, discussion.md 共识 006):
+# resolve the MuJoCo batch executor from the sibling checkout. Relative path +
+# editable only. Native changes in ../mujoco_uni still need an explicit rebuild
+# (see ../mujoco_uni/AGENTS.md, `make install`).
+mujoco-uni-runtime = { path = "../mujoco_uni", editable = true }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
