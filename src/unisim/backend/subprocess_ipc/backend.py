@@ -39,11 +39,21 @@ from unisim.backend.base import (
     normalize_play_render_mode,
     unsupported_debug_overlay_error,
 )
+from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
+    InitRandomizationPlan,
+    IntervalRandomizationPlan,
     ResetRandomizationPayload,
 )
-from unisim.scene import SceneCfg
+from unisim.scene import (
+    ENTITY_MATERIALIZATION_RIGID,
+    ENTITY_ROOT_FLOATING,
+    MODEL_FORMAT_URDF,
+    ActuatorGainOverride,
+    SceneCfg,
+    SceneEntitySpec,
+)
 from unisim.utils.rotation import (
     np_quat_apply_batched,
     np_quat_apply_inverse_batched,
@@ -62,6 +72,7 @@ from .sensors import (
     SceneMetadata,
     SceneSensorSpec,
     UnsupportedSensorSpec,
+    scan_scene_entities,
     scan_scene_metadata,
 )
 
@@ -81,6 +92,129 @@ _ROOT_QVEL_DIM = 6
 # PhysX clamps |force| <= dof effort; MJCF forcerange "0 0" (or absent) means
 # unlimited, mapped to a finite stand-in (float32-safe) for the dof property.
 _UNLIMITED_DOF_EFFORT = 1e20
+
+
+def build_init_variant_pool_payload(
+    plan: InitRandomizationPlan,
+    *,
+    num_envs: int,
+    entity_assets: tuple[SceneEntitySpec, ...],
+    backend_label: str,
+) -> dict[str, Any]:
+    """Validate an init-randomization plan into a worker INIT payload entry.
+
+    Pure cold-path validation shared by every subprocess backend that supports
+    whole-file model variants (SimToolReal step 1.3).  One plan maps to one
+    ``MultiUsdFileCfg``-style pool on the worker, so all variants must target
+    the same declared scene entity; that entity must be a floating rigid
+    object whose declared format matches the variant files.  Every check
+    fails closed: geom-only variants, non-URDF sources, undeclared targets,
+    missing files, and malformed assignments are all rejected before any
+    worker is spawned.
+    """
+    variants = tuple(plan.model_variants)
+    if not variants:
+        raise ValueError(f"{backend_label} init variant pool requires at least one variant")
+    targets: set[str] = set()
+    source_files: list[str] = []
+    masses: list[float] = []
+    has_mass = False
+    for index, variant in enumerate(variants):
+        if variant.source_model_file is None:
+            raise NotImplementedError(
+                f"{backend_label} supports whole-file model variants only; variant {index} "
+                "carries geom_size_overrides, which require an in-process compiler"
+            )
+        if variant.source_format != MODEL_FORMAT_URDF:
+            raise NotImplementedError(
+                f"{backend_label} whole-file variants must be URDF; variant {index} has "
+                f"source_format={variant.source_format!r}"
+            )
+        if variant.target_entity is None:
+            raise ValueError(
+                f"{backend_label} whole-file variant {index} must declare target_entity; "
+                "replacing the primary scene model per env is unsupported"
+            )
+        targets.add(variant.target_entity)
+        path = Path(variant.source_model_file).expanduser()
+        if not path.is_file():
+            raise ValueError(
+                f"{backend_label} variant {index} source_model_file does not exist: {path}"
+            )
+        source_files.append(str(path.resolve()))
+        if variant.mass is None:
+            if has_mass:
+                raise ValueError(
+                    f"{backend_label} init variant pool mass metadata is incomplete at "
+                    f"variant {index}"
+                )
+        else:
+            if not has_mass and masses:
+                raise ValueError(
+                    f"{backend_label} init variant pool mass metadata is incomplete at "
+                    f"variant {index}"
+                )
+            has_mass = True
+            masses.append(float(variant.mass))
+    if len(targets) != 1:
+        raise ValueError(
+            f"{backend_label} init variant plans must target exactly one scene entity, "
+            f"got {sorted(targets)}; one plan maps to one worker-side asset pool"
+        )
+    target = next(iter(targets))
+    specs_by_name = {spec.name: spec for spec in entity_assets}
+    spec = specs_by_name.get(target)
+    if spec is None:
+        raise ValueError(
+            f"{backend_label} variant target_entity {target!r} is not a declared scene "
+            f"entity; declared: {sorted(specs_by_name)}"
+        )
+    if spec.materialization != ENTITY_MATERIALIZATION_RIGID:
+        raise NotImplementedError(
+            f"{backend_label} variant target {target!r} has materialization "
+            f"{spec.materialization!r}; only rigid-object pools are supported"
+        )
+    if spec.root_mode != ENTITY_ROOT_FLOATING:
+        raise NotImplementedError(
+            f"{backend_label} variant target {target!r} has root_mode {spec.root_mode!r}; "
+            "only floating rigid-object pools are supported"
+        )
+    if spec.asset_format != MODEL_FORMAT_URDF:
+        raise ValueError(
+            f"{backend_label} variant target {target!r} declares asset_format "
+            f"{spec.asset_format!r}, which does not match the URDF variant files"
+        )
+
+    raw_assignments = np.asarray(plan.model_assignments)
+    if raw_assignments.dtype == bool or not np.issubdtype(raw_assignments.dtype, np.integer):
+        raise ValueError(
+            f"{backend_label} model_assignments must have an integer dtype, "
+            f"got {raw_assignments.dtype}"
+        )
+    assignments = raw_assignments.astype(np.int64, copy=False)
+    if assignments.shape != (int(num_envs),):
+        raise ValueError(
+            f"{backend_label} model_assignments must have shape ({int(num_envs)},), "
+            f"got {raw_assignments.shape}"
+        )
+    if np.any(assignments < 0) or np.any(assignments >= len(variants)):
+        raise ValueError(
+            f"{backend_label} model_assignments must be in [0, {len(variants)}), "
+            f"got min={int(assignments.min())}, max={int(assignments.max())}"
+        )
+    payload = {
+        "target_entity": target,
+        "source_files": source_files,
+        "assignments": [int(value) for value in assignments],
+    }
+    if has_mass:
+        if len(masses) != len(variants):
+            raise ValueError(
+                f"{backend_label} init variant pool mass metadata has {len(masses)} entries; "
+                f"expected {len(variants)}"
+            )
+        payload["masses"] = masses
+    return payload
 
 
 def _display_available() -> bool:
@@ -201,6 +335,9 @@ class MjcfSubprocessBackend(SimBackend):
     _BACKEND_LABEL = "subprocess"
     _WORKER_ERROR_CLS: type[SubprocessWorkerError] = SubprocessWorkerError
     _MODEL_INFO_CLS: type[SubprocessModelInfo] = SubprocessModelInfo
+    # Workers that materialize whole-file model variant pools at INIT opt in
+    # here; the rest fail closed on non-empty InitRandomizationPlans.
+    _SUPPORTS_INIT_MODEL_VARIANTS = False
 
     def _worker_error(self, message: str, **kwargs: Any) -> SubprocessWorkerError:
         """Construct the concrete adapter's public worker error type."""
@@ -322,12 +459,20 @@ class MjcfSubprocessBackend(SimBackend):
         self._stderr_file: Any = None
         self._worker_dead_error: SubprocessWorkerError | None = None
         self._model_info: SubprocessModelInfo | None = None
+        # Full INIT metadata for diagnostics/probes (variant assignment
+        # forensics, actuator gain readback); ``None`` before materialize().
+        self._worker_init_meta: dict[str, Any] | None = None
         # Optional diagnostics supplied by workers that maintain private
         # world-space environment origins. Workers that do not send this
         # metadata leave the value as ``None``.
         self._worker_env_origins: np.ndarray | None = None
         self._collision_filtering_applied = False
         self._scene_metadata: SceneMetadata | None = None
+        self._entity_metadata: dict[str, SceneMetadata] | None = None
+        # Validated init-lifecycle variant pool, serialized into INIT.  Set by
+        # apply_init_randomization before materialization; ``None`` keeps the
+        # legacy INIT payload byte-identical.
+        self._init_variant_pool: dict[str, Any] | None = None
         self._initial_qpos: np.ndarray | None = None
         self._initial_qpos_resolved = False
         self._fixed_variant_plan = scene.fixed_variant_plan
@@ -337,6 +482,13 @@ class MjcfSubprocessBackend(SimBackend):
         self._sensor_map: dict[str, tuple[SceneSensorSpec, int]] = {}
         self._body_id_by_name: dict[str, int] = {}
         self._dof_id_by_name: dict[str, int] = {}
+        # Rigid scene entities (SimToolReal step 1.3c), in declaration order.
+        # Each owns one ``entity_root_state__<name>``/``entity_reset_state__<name>``
+        # shm slot pair; its scanned root body name maps to the extended body id
+        # ``num_bodies + k`` so the public body getters route to the new slot.
+        # Empty for legacy single-articulation scenes.
+        self._rigid_root_entities: tuple[str, ...] = ()
+        self._rigid_root_body_names: dict[str, str] = {}
         self._base_body_id = 0
         self._closed = False
         # Native rendering state (worker-owned viewer/camera; see the play
@@ -416,6 +568,12 @@ class MjcfSubprocessBackend(SimBackend):
                     "num_envs": self._num_envs,
                     "sim_dt": self._sim_dt,
                     "device_id": self._device_id,
+                    # Fixed-base scenes (no free joint in the metadata scan)
+                    # must not write root pose/velocity.  For URDF inputs the
+                    # fix/float choice is a converter flag: it comes from the
+                    # matching SceneEntitySpec root_mode when the scene
+                    # declares entity_assets, else the step-0 default (fixed).
+                    "fixed_base": self._get_scene_metadata().freejoint_body_name is None,
                     **runtime_payload,
                     **worker_init_payload,
                     "root_body_name": self._base_name
@@ -441,9 +599,15 @@ class MjcfSubprocessBackend(SimBackend):
                         }
                     ),
                     **fixed_variant_payload,
+                    # Multi-asset scenes (SimToolReal step 1): per-role asset,
+                    # fixed_base, and gain-resolved actuation arrays.  Empty
+                    # list for legacy single-asset scenes.
+                    "entities": self._entity_payloads(),
+                    **self._init_randomization_payload(),
                 },
                 expect=protocol.CMD_META,
             )
+            self._worker_init_meta = dict(meta)
             self._bind_model_metadata(meta)
             self._graphics_enabled = bool(meta.get("graphics_enabled", False))
             self._validate_initial_keyframe()
@@ -466,17 +630,38 @@ class MjcfSubprocessBackend(SimBackend):
         # teardown; the atexit hook is unregistered by close().
         atexit.register(self.close)
 
+    def _primary_entity_spec(self) -> SceneEntitySpec | None:
+        """Return the declared entity whose asset is the scene's primary model file."""
+        if not self._scene.entity_assets:
+            return None
+        model_path = Path(self._scene.model_file).expanduser().resolve()
+        for spec in self._scene.entity_assets:
+            if Path(spec.model_file).expanduser().resolve() == model_path:
+                return spec
+        return None
+
     def _get_scene_metadata(self) -> SceneMetadata:
         """Return the parent-side MJCF scan, scanning lazily on first access.
 
         This is pure XML metadata — no worker handshake is required, matching
         the MuJoCo backend where the model (and thus keyframes) is available
-        right after construction.  ``materialize()`` reuses this cache.
+        right after construction.  ``materialize()`` reuses this cache.  When
+        the primary asset is a URDF declared in ``SceneCfg.entity_assets``,
+        the entity's ``root_mode`` supplies the converter fixed/floating
+        choice; otherwise the step-0 default (fixed) applies.
         """
         if self._scene_metadata is None:
+            model_path = Path(self._scene.model_file).expanduser()
+            spec = self._primary_entity_spec()
+            urdf_fixed_base = (
+                spec.fixed_base
+                if spec is not None and model_path.suffix.lower() == ".urdf"
+                else None
+            )
             self._scene_metadata = scan_scene_metadata(
-                str(Path(self._scene.model_file).expanduser()),
+                str(model_path),
                 backend_label=self._BACKEND_LABEL,
+                urdf_fixed_base=urdf_fixed_base,
             )
         return self._scene_metadata
 
@@ -527,6 +712,19 @@ class MjcfSubprocessBackend(SimBackend):
                         f"canonical={expected}, variant={actual}; IsaacGym requires "
                         "one actor slot with identical dof/body name order per environment"
                     )
+
+    def _get_entity_metadata(self) -> dict[str, SceneMetadata]:
+        """Return per-role metadata for ``SceneCfg.entity_assets`` (cold path).
+
+        Scans lazily on first access, validating per-role fixed_base and
+        actuator gain overrides fail-closed before any worker is spawned.
+        Empty when the scene declares no entity assets.
+        """
+        if self._entity_metadata is None:
+            self._entity_metadata = scan_scene_entities(
+                self._scene.entity_assets, backend_label=self._BACKEND_LABEL
+            )
+        return self._entity_metadata
 
     def _resolve_initial_qpos(self) -> np.ndarray | None:
         """Lazily select the scene keyframe used as the backend default state."""
@@ -656,6 +854,7 @@ class MjcfSubprocessBackend(SimBackend):
         self._body_id_by_name = {name: index for index, name in enumerate(body_names)}
         self._dof_id_by_name = {name: index for index, name in enumerate(dof_names)}
         self._validate_fixed_variant_handshake(meta)
+        self._bind_rigid_root_entities(meta)
         self._validate_xml_metadata_against_worker()
 
     def _validate_fixed_variant_handshake(self, meta: dict[str, Any]) -> None:
@@ -703,19 +902,131 @@ class MjcfSubprocessBackend(SimBackend):
             ],
         }
 
-    def _position_actuation_payload(self) -> dict[str, list[float]]:
+    def _bind_rigid_root_entities(self, meta: dict[str, Any]) -> None:
+        """Bind declared rigid entities to shm slots and extended body ids.
+
+        Runs at INIT metadata binding (cold path).  The worker's ``entities``
+        INIT meta is cross-checked against the declared specs fail-closed, then
+        each rigid entity's scanned root body name is mapped to the extended
+        body id ``num_bodies + k`` (declaration order), so the public
+        ``get_body_*_w`` getters route those names to the per-entity
+        ``entity_root_state__`` slot while robot bodies keep the existing
+        ``body_state`` slot.  Legacy scenes bind nothing.
+        """
+        rigid_specs = tuple(
+            spec
+            for spec in self._scene.entity_assets
+            if spec.materialization == ENTITY_MATERIALIZATION_RIGID
+        )
+        if not rigid_specs:
+            if meta.get("entities"):
+                raise self._worker_error(
+                    f"{self._BACKEND_LABEL} worker reported scene entities but the scene "
+                    "declares no entity_assets; refusing to guess a mapping"
+                )
+            return
+        worker_entities = meta.get("entities")
+        if not isinstance(worker_entities, list):
+            raise self._worker_error(
+                f"{self._BACKEND_LABEL} scene declares entity_assets but the worker INIT "
+                "meta carries no entities list; the worker is out of sync with the host"
+            )
+        worker_rigid = [
+            str(entry.get("name"))
+            for entry in worker_entities
+            if str(entry.get("materialization")) == ENTITY_MATERIALIZATION_RIGID
+        ]
+        declared = [spec.name for spec in rigid_specs]
+        if worker_rigid != declared:
+            raise self._worker_error(
+                f"{self._BACKEND_LABEL} worker rigid entities {worker_rigid} do not match "
+                f"the declared scene entities {declared}; refusing to bind root slots"
+            )
+        entity_metadata = self._get_entity_metadata()
+        self._rigid_root_entities = tuple(declared)
+        self._rigid_root_body_names = {}
+        for index, spec in enumerate(rigid_specs):
+            scanned = entity_metadata[spec.name]
+            root_body = scanned.freejoint_body_name or scanned.urdf_root_link_name
+            if not root_body:
+                raise self._worker_error(
+                    f"{self._BACKEND_LABEL} rigid entity {spec.name!r} has no scanned root "
+                    "body name; cannot bind a root state slot"
+                )
+            if (
+                root_body in self._body_id_by_name
+                or root_body in self._rigid_root_body_names.values()
+            ):
+                raise self._worker_error(
+                    f"{self._BACKEND_LABEL} rigid entity {spec.name!r} root body "
+                    f"{root_body!r} collides with an existing body name; refusing to "
+                    "overload the body map"
+                )
+            self._rigid_root_body_names[spec.name] = root_body
+            self._body_id_by_name[root_body] = self._model_info.num_bodies + index
+
+    def _position_actuation_payload(
+        self,
+        metadata: SceneMetadata | None = None,
+        gain_overrides: tuple[ActuatorGainOverride, ...] | None = None,
+    ) -> dict[str, list[float]]:
         """Per-dof PD/limit/dynamics arrays in MJCF joint document order.
 
         The worker maps them onto the asset's dof order by name.  Joints with
         no ``<position>`` actuator are passive: zero gains and zero effort.
+
+        Owner-supplied ``gain_overrides`` (by joint name) replace the scanned
+        stiffness/damping and, when set, armature/frictionloss; unknown joint
+        names fail closed.  With both arguments left as ``None`` the primary
+        scene metadata is used, picking up the matching entity spec's gain
+        overrides when the scene declares one for ``model_file``.
         """
-        fields = self._position_actuation_payload_for(self._get_scene_metadata())
+        if metadata is None:
+            metadata = self._get_scene_metadata()
+            spec = self._primary_entity_spec()
+            gain_overrides = () if spec is None else spec.actuator_gain_overrides
+        overrides = {override.joint_name: override for override in gain_overrides or ()}
+        unknown = sorted(set(overrides) - set(metadata.joint_names))
+        if unknown:
+            raise ValueError(
+                f"{self._BACKEND_LABEL} actuator gain overrides reference joints not in "
+                f"the scanned asset: {unknown}; scanned joints: {list(metadata.joint_names)}"
+            )
+        by_joint = {spec.joint_name: spec for spec in metadata.actuators}
+        stiffness: list[float] = []
+        damping: list[float] = []
+        effort: list[float] = []
+        armature: list[float] = []
+        friction: list[float] = []
+        for index, joint in enumerate(metadata.joint_names):
+            spec = by_joint.get(joint)
+            if spec is None:
+                stiffness.append(0.0)
+                damping.append(0.0)
+                effort.append(0.0)
+            else:
+                stiffness.append(spec.kp)
+                damping.append(spec.kv)
+                # PhysX clamps |force| <= effort; the scan guarantees symmetry.
+                effort.append(
+                    _UNLIMITED_DOF_EFFORT if spec.forcerange is None else spec.forcerange[1]
+                )
+            armature.append(float(metadata.joint_armature[index]))
+            friction.append(float(metadata.joint_frictionloss[index]))
+            override = overrides.get(joint)
+            if override is not None:
+                stiffness[-1] = float(override.stiffness)
+                damping[-1] = float(override.damping)
+                if override.armature is not None:
+                    armature[-1] = float(override.armature)
+                if override.frictionloss is not None:
+                    friction[-1] = float(override.frictionloss)
         return {
-            "dof_stiffness": fields["stiffness"],
-            "dof_damping": fields["damping"],
-            "dof_effort": fields["effort"],
-            "dof_armature": fields["armature"],
-            "dof_friction": fields["friction"],
+            "dof_stiffness": stiffness,
+            "dof_damping": damping,
+            "dof_effort": effort,
+            "dof_armature": armature,
+            "dof_friction": friction,
         }
 
     def _position_actuation_payload_for(
@@ -747,6 +1058,93 @@ class MjcfSubprocessBackend(SimBackend):
             "armature": [float(value) for value in metadata.joint_armature],
             "friction": [float(value) for value in metadata.joint_frictionloss],
         }
+
+    def _entity_payloads(self) -> list[dict[str, Any]]:
+        """Per-entity INIT entries for multi-asset scenes (SimToolReal step 1).
+
+        Each entry mirrors the top-level single-asset INIT contract (actuation
+        arrays in joint document order, ``fixed_base``/``root_body_name`` from
+        the per-role scan) plus the typed declaration fields, so the worker
+        can materialize one articulation/rigid object per role.  Contact
+        material declarations (``friction``/``friction_by_body``) are appended
+        only when the spec declares them.  Empty when the scene declares no
+        ``entity_assets``; the legacy top-level keys are unchanged either way.
+        """
+        specs = tuple(self._scene.entity_assets)
+        if not specs:
+            return []
+        metadata_by_name = self._get_entity_metadata()
+        payloads: list[dict[str, Any]] = []
+        for spec in specs:
+            metadata = metadata_by_name[spec.name]
+            entry: dict[str, Any] = {
+                "name": spec.name,
+                "model_file": str(Path(spec.model_file).expanduser()),
+                "asset_format": spec.asset_format,
+                "materialization": spec.materialization,
+                "root_mode": spec.root_mode,
+                "fixed_base": metadata.freejoint_body_name is None,
+                # Floating assets name their free-joint body; fixed-base
+                # URDF assets fall back to the scanned root link so the
+                # worker can still locate the articulation root prim.
+                "root_body_name": (metadata.freejoint_body_name or metadata.urdf_root_link_name),
+                "joint_names": list(metadata.joint_names),
+                "body_names": list(metadata.body_names),
+                **self._position_actuation_payload(
+                    metadata, gain_overrides=spec.actuator_gain_overrides
+                ),
+            }
+            # Contact materials are opt-in: undeclared entities carry no
+            # friction keys at all, keeping legacy payloads byte-identical.
+            if spec.contact_friction is not None:
+                entry["friction"] = [float(value) for value in spec.contact_friction]
+                if spec.contact_friction_by_body:
+                    entry["friction_by_body"] = {
+                        override.body_name: [float(value) for value in override.friction]
+                        for override in spec.contact_friction_by_body
+                    }
+            payloads.append(entry)
+        return payloads
+
+    def _init_randomization_payload(self) -> dict[str, Any]:
+        """INIT entry for the validated variant pool; empty for legacy scenes."""
+        if self._init_variant_pool is None:
+            return {}
+        return {"variant_pool": dict(self._init_variant_pool)}
+
+    def apply_init_randomization(self, plan: InitRandomizationPlan) -> None:
+        """Validate and stage a whole-file model-variant pool for INIT.
+
+        The pool is serialized into the INIT payload, so it must be applied
+        before materialization; the worker converts each source URDF once and
+        pins the per-env assignment for the worker's lifetime (reset never
+        recompiles or reassigns).  Validation lives in
+        :func:`build_init_variant_pool_payload` and fails closed on
+        unsupported variant kinds, undeclared targets, and out-of-range
+        assignments.
+        """
+        if plan.is_empty():
+            return
+        if not self._SUPPORTS_INIT_MODEL_VARIANTS:
+            raise NotImplementedError(
+                f"{self._BACKEND_LABEL} does not support init-lifecycle model variants"
+            )
+        if self._proc is not None:
+            raise RuntimeError(
+                f"{self._BACKEND_LABEL} init randomization must run before worker "
+                "materialization; the variant pool is fixed at INIT"
+            )
+        if self._init_variant_pool is not None:
+            raise RuntimeError(
+                f"{self._BACKEND_LABEL} init randomization was already applied; "
+                "variant assignments are immutable for one worker lifetime"
+            )
+        self._init_variant_pool = build_init_variant_pool_payload(
+            plan,
+            num_envs=self._num_envs,
+            entity_assets=tuple(self._scene.entity_assets),
+            backend_label=self._BACKEND_LABEL,
+        )
 
     def _validate_xml_metadata_against_worker(self) -> None:
         """Fail closed when the MJCF importer changed names or ordering.
@@ -781,10 +1179,14 @@ class MjcfSubprocessBackend(SimBackend):
     def _allocate_slots(self) -> None:
         assert self._model_info is not None
         shapes = protocol.slot_shapes(
-            self._num_envs, self._model_info.num_dof, self._model_info.num_bodies
+            self._num_envs,
+            self._model_info.num_dof,
+            self._model_info.num_bodies,
+            rigid_root_entities=self._rigid_root_entities,
         )
-        for name in protocol.SLOT_NAMES:
-            shape = shapes[name]
+        # Legacy scenes: shapes keys are exactly protocol.SLOT_NAMES, so the
+        # allocation sequence (and the ATTACH payload) is byte-identical.
+        for name, shape in shapes.items():
             handle = shared_memory.SharedMemory(create=True, size=protocol.slot_nbytes(name, shape))
             self._shm_handles[name] = handle
             self._slots[name] = np.ndarray(
@@ -1105,6 +1507,14 @@ class MjcfSubprocessBackend(SimBackend):
     def get_root_state_layout(self, root_body_name: str) -> BackendRootStateLayout:
         if self._model_info is not None:
             root_name = self._model_info.body_names[0]
+            if root_body_name in self._rigid_root_body_names.values():
+                # Multi-asset rigid roots use the same 7+6 public layout as
+                # the primary actor, but their rows live in the entity root
+                # slots rather than the robot qpos/qvel slots.
+                return BackendRootStateLayout(
+                    qpos_indices=tuple(range(_ROOT_QPOS_DIM)),
+                    qvel_indices=tuple(range(_ROOT_QVEL_DIM)),
+                )
         else:
             metadata = self._get_scene_metadata()
             if metadata.freejoint_body_name is None:
@@ -1123,6 +1533,10 @@ class MjcfSubprocessBackend(SimBackend):
             qpos_indices=tuple(range(_ROOT_QPOS_DIM)),
             qvel_indices=tuple(range(_ROOT_QVEL_DIM)),
         )
+
+    def get_rigid_root_entities(self) -> tuple[str, ...]:
+        """Return materialized rigid scene entities with independent root slots."""
+        return tuple(self._rigid_root_entities)
 
     def get_body_ids(self, names: Sequence[str]) -> np.ndarray:
         body_map = self._body_name_map()
@@ -1215,9 +1629,11 @@ class MjcfSubprocessBackend(SimBackend):
     def set_state(
         self,
         env_indices: np.ndarray,
-        qpos: np.ndarray,
-        qvel: np.ndarray,
+        qpos: np.ndarray | None = None,
+        qvel: np.ndarray | None = None,
         randomization: ResetRandomizationPayload | None = None,
+        *,
+        entity_root_states: Mapping[str, np.ndarray] | None = None,
     ) -> dict[str, dict[str, float]]:
         self._require_state("set_state")
         if randomization is not None and not randomization.is_empty():
@@ -1236,12 +1652,53 @@ class MjcfSubprocessBackend(SimBackend):
             raise ValueError("env_indices must not contain duplicate rows")
         nq = _ROOT_QPOS_DIM + info.num_dof
         nv = _ROOT_QVEL_DIM + info.num_dof
-        qpos_array = np.asarray(qpos, dtype=np.float32)
-        qvel_array = np.asarray(qvel, dtype=np.float32)
-        if qpos_array.shape != (rows.size, nq):
-            raise ValueError(f"qpos must have shape ({rows.size}, {nq}), got {qpos_array.shape}")
-        if qvel_array.shape != (rows.size, nv):
-            raise ValueError(f"qvel must have shape ({rows.size}, {nv}), got {qvel_array.shape}")
+        # ``qpos``/``qvel`` are paired: both None means the robot's generalized
+        # state is not touched by this transaction (e.g. a goalviz-only reset,
+        # which must not perturb object or robot state — DESIGN.md §4).
+        if (qpos is None) != (qvel is None):
+            raise ValueError("set_state qpos and qvel must be provided together or both omitted")
+        robot_write = qpos is not None
+        qpos_array = None
+        qvel_array = None
+        if robot_write:
+            qpos_array = np.asarray(qpos, dtype=np.float32)
+            qvel_array = np.asarray(qvel, dtype=np.float32)
+            if qpos_array.shape != (rows.size, nq):
+                raise ValueError(
+                    f"qpos must have shape ({rows.size}, {nq}), got {qpos_array.shape}"
+                )
+            if qvel_array.shape != (rows.size, nv):
+                raise ValueError(
+                    f"qvel must have shape ({rows.size}, {nv}), got {qvel_array.shape}"
+                )
+            if not np.isfinite(qpos_array).all() or not np.isfinite(qvel_array).all():
+                raise ValueError("set_state qpos/qvel must be finite (no NaN or Inf)")
+        entity_states: dict[str, np.ndarray] = {}
+        for entity, value in (entity_root_states or {}).items():
+            name = str(entity)
+            if name not in self._rigid_root_entities:
+                raise ValueError(
+                    f"set_state entity_root_states must name declared rigid scene "
+                    f"entities {list(self._rigid_root_entities)}, got {name!r}"
+                )
+            # Layout matches the read slot: pos xyz, quat wxyz, world linear
+            # velocity, world angular velocity (batch-first).
+            array = np.asarray(value, dtype=np.float32)
+            if array.shape != (rows.size, 13):
+                raise ValueError(
+                    f"set_state entity_root_states[{name!r}] must have shape "
+                    f"({rows.size}, 13), got {array.shape}"
+                )
+            if not np.isfinite(array).all():
+                raise ValueError(
+                    f"set_state entity_root_states[{name!r}] must be finite (no NaN or Inf)"
+                )
+            entity_states[name] = array
+        if not robot_write and not entity_states and rows.size > 0:
+            raise ValueError(
+                "set_state requires qpos/qvel or at least one entity root state; "
+                "an empty write would be a silent no-op"
+            )
 
         timing: dict[str, float] = {key: 0.0 for key in self._SET_STATE_TIMING_ZERO_KEYS}
         timing.update(
@@ -1258,9 +1715,20 @@ class MjcfSubprocessBackend(SimBackend):
         t0 = time.perf_counter()
         count = int(rows.size)
         np.copyto(self._slots["reset_env_ids"][:count], rows.astype(np.int32))
-        np.copyto(self._slots["reset_qpos"][:count], qpos_array)
-        np.copyto(self._slots["reset_qvel"][:count], qvel_array)
-        payload = self._request(protocol.CMD_SET_STATE, {"count": count}, expect=protocol.CMD_READY)
+        # Legacy scenes (no rigid entities, robot state always written) send
+        # exactly {"count": count}; the extra keys exist only for multi-asset
+        # scenes so older mujoco-family workers never see them.
+        payload: dict[str, Any] = {"count": count}
+        if robot_write:
+            assert qpos_array is not None and qvel_array is not None
+            np.copyto(self._slots["reset_qpos"][:count], qpos_array)
+            np.copyto(self._slots["reset_qvel"][:count], qvel_array)
+        for name, array in entity_states.items():
+            np.copyto(self._slots[protocol.entity_reset_state_slot(name)][:count], array)
+        if self._rigid_root_entities:
+            payload["robot"] = robot_write
+            payload["entity_roots"] = sorted(entity_states)
+        payload = self._request(protocol.CMD_SET_STATE, payload, expect=protocol.CMD_READY)
         ipc_ms = (time.perf_counter() - t0) * 1000.0
         if isinstance(payload, dict):
             worker_timing = payload.get("timing", {})
@@ -1276,8 +1744,80 @@ class MjcfSubprocessBackend(SimBackend):
         return {"timing": timing}
 
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
-        """Advertise no DR until per-env model mutation is effect-tested."""
-        return DomainRandomizationCapabilities()
+        """Advertise interval wrench support for declared rigid entities."""
+        if not self._rigid_root_entities:
+            return DomainRandomizationCapabilities()
+        return DomainRandomizationCapabilities(
+            supports_interval_body_force=True,
+            supports_interval_body_torque=True,
+            supported_interval_terms=frozenset(
+                {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
+            ),
+        )
+
+    def _stage_body_wrench(
+        self,
+        body_ids: np.ndarray,
+        force: np.ndarray,
+        torque: np.ndarray | None,
+    ) -> None:
+        """Accumulate one public body-wrench operation into dense shm slots."""
+        if not self._rigid_root_entities:
+            raise NotImplementedError(
+                f"{self._BACKEND_LABEL} worker has no rigid-entity wrench slots"
+            )
+        ids = np.asarray(body_ids, dtype=np.intp)
+        info = self._require_materialized()
+        extended = info.num_bodies + len(self._rigid_root_entities)
+        if (
+            ids.ndim != 1
+            or ids.size == 0
+            or np.any(ids < info.num_bodies)
+            or np.any(ids >= extended)
+            or np.unique(ids).size != ids.size
+        ):
+            raise ValueError(
+                f"{self._BACKEND_LABEL} wrench body_ids must select unique rigid roots in "
+                f"[{info.num_bodies}, {extended}), got {ids.tolist()}"
+            )
+        values = np.asarray(force, dtype=np.float32)
+        expected = (self._num_envs, ids.size, 3)
+        if values.shape != expected or not np.isfinite(values).all():
+            raise ValueError(f"wrench force must have finite shape {expected}, got {values.shape}")
+        if torque is None:
+            torque_values = np.zeros(expected, dtype=np.float32)
+        else:
+            torque_values = np.asarray(torque, dtype=np.float32)
+            if torque_values.shape != expected or not np.isfinite(torque_values).all():
+                raise ValueError(
+                    f"wrench torque must have finite shape {expected}, got {torque_values.shape}"
+                )
+        self._slots[protocol.WRENCH_FORCE_SLOT][:, ids, :] += values
+        self._slots[protocol.WRENCH_TORQUE_SLOT][:, ids, :] += torque_values
+
+    def apply_interval_randomization(self, plan: IntervalRandomizationPlan) -> None:
+        """Stage interval force/torque rows for the next worker control step."""
+        if plan.is_empty():
+            return
+        if not self._rigid_root_entities:
+            return super().apply_interval_randomization(plan)
+        self._require_state("apply_interval_randomization")
+        self._slots[protocol.WRENCH_FORCE_SLOT].fill(0.0)
+        self._slots[protocol.WRENCH_TORQUE_SLOT].fill(0.0)
+        for op in plan.iter_ops():
+            op.validate()
+            if op.term == INTERVAL_TERM_BODY_FORCE:
+                assert op.body_ids is not None
+                self._stage_body_wrench(op.body_ids, op.payload, None)
+            elif op.term == INTERVAL_TERM_BODY_TORQUE:
+                assert op.body_ids is not None
+                zeros = np.zeros_like(op.payload, dtype=np.float32)
+                self._stage_body_wrench(op.body_ids, zeros, op.payload)
+            else:
+                raise NotImplementedError(
+                    f"{self._BACKEND_LABEL} multi-asset worker does not support interval "
+                    f"term {op.term!r}"
+                )
 
     # ------------------------------------------------------------------ #
     # Native rendering / playback (worker-owned viewer and camera sensor)
@@ -1496,11 +2036,30 @@ class MjcfSubprocessBackend(SimBackend):
     def _selected_body_state(self, body_ids: np.ndarray) -> np.ndarray:
         ids = np.asarray(body_ids, dtype=np.intp)
         info = self._require_materialized()
-        if ids.ndim != 1 or np.any(ids < 0) or np.any(ids >= info.num_bodies):
+        num_robot_bodies = info.num_bodies
+        num_extended = num_robot_bodies + len(self._rigid_root_entities)
+        if ids.ndim != 1 or np.any(ids < 0) or np.any(ids >= num_extended):
             raise ValueError(
-                f"body_ids must be a 1-D array in [0, {info.num_bodies}), got {body_ids!r}"
+                f"body_ids must be a 1-D array in [0, {num_extended}), got {body_ids!r}"
             )
-        return self._body_slot()[:, ids, :]
+        if not self._rigid_root_entities or not np.any(ids >= num_robot_bodies):
+            # Legacy path (robot-only ids): unchanged fancy-index into the
+            # body_state slot.
+            return self._body_slot()[:, ids, :]
+        # Mixed selection: robot bodies come from body_state; rigid entity
+        # roots (extended ids, declaration order) come from their per-entity
+        # root state slots.
+        result = np.empty((self._num_envs, ids.size, 13), dtype=np.float32)
+        robot_mask = ids < num_robot_bodies
+        if np.any(robot_mask):
+            result[:, robot_mask, :] = self._body_slot()[:, ids[robot_mask], :]
+        for index, entity in enumerate(self._rigid_root_entities):
+            entity_mask = ids == num_robot_bodies + index
+            if np.any(entity_mask):
+                result[:, entity_mask, :] = self._slots[protocol.entity_root_state_slot(entity)][
+                    :, None, :
+                ]
+        return result
 
     def get_body_pos_w(self, body_ids: np.ndarray) -> np.ndarray:
         return self._selected_body_state(body_ids)[:, :, 0:3]
@@ -1594,4 +2153,5 @@ __all__ = [
     "SubprocessModelInfo",
     "SubprocessWorkerError",
     "_normalize_camera_kwargs",
+    "build_init_variant_pool_payload",
 ]

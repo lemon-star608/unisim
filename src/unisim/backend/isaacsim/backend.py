@@ -82,6 +82,8 @@ class IsaacSimBackend(MjcfSubprocessBackend):
     _BACKEND_LABEL = "isaacsim"
     _WORKER_ERROR_CLS = IsaacSimWorkerError
     _MODEL_INFO_CLS = IsaacSimModelInfo
+    # The worker converts URDF variant pools and spawns them round-robin.
+    _SUPPORTS_INIT_MODEL_VARIANTS = True
 
     def __init__(
         self,
