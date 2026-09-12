@@ -149,6 +149,59 @@ def _patch_urdf_articulation_root(usd_path: str, root_name: str) -> None:
 _CONTACT_OFFSET = 0.002  # scene_utils.py:133
 _REST_OFFSET = 0.0  # scene_utils.py:134
 
+# Scene-level PhysX configuration for the SimToolReal multi-asset path, a
+# literal port of the original repository's `_default_sim_cfg` PhysxCfg
+# (isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py:515-535).  Isaac Lab's
+# defaults differ in behavior-relevant ways: solver iteration clamps (1/255 and
+# 0/255 vs 8/8 and 0/0), the contact bounce threshold (0.5 vs 0.2), and the GPU
+# contact stream buffers (2**23 contacts / 5*2**15 patches vs 2**24 / 2**23 —
+# the original repository raised them because Lab's defaults report "Patch
+# buffer overflow detected" and kill training at its 24,576-env scale).  The
+# friction offset/correlation distances equal the PhysX defaults on both sides
+# and are kept explicit to mirror the source.  Multi-asset scenes only; the
+# legacy single-asset path keeps Isaac Lab defaults (pipeline-audit.md F1).
+SIMTOOLREAL_SCENE_PHYSX_KWARGS: dict[str, Any] = {
+    "solver_type": 1,  # 1 = TGS (matches legacy)
+    "min_position_iteration_count": 8,
+    "max_position_iteration_count": 8,
+    "min_velocity_iteration_count": 0,
+    "max_velocity_iteration_count": 0,
+    "bounce_threshold_velocity": 0.2,
+    "friction_offset_threshold": 0.04,
+    "friction_correlation_distance": 0.025,
+    "gpu_max_rigid_contact_count": 2**24,
+    "gpu_max_rigid_patch_count": 2**23,
+}
+
+# Original repository robot spawn pose (scene_utils.py:1811-1842, pos at
+# :1821): the iiwa stands 0.8 m behind the table.  Load-bearing for the
+# fixed-base robot — the root pose has no other write channel (fixed-base
+# root writes are fail-closed and reset events own joints plus the
+# rigid-entity roots), so a missing init_state leaves the base at the env
+# origin, inside the table (pipeline-audit.md F6).  Joint-position init
+# values stay unset: UniLab reset events write the full joint state before
+# the first step (registered structural deviation, no behavioral difference).
+SIMTOOLREAL_ROBOT_INIT_POS: tuple[float, float, float] = (0.0, 0.8, 0.0)
+SIMTOOLREAL_ROBOT_INIT_ROT_WXYZ: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+# Original repository env grid spacing (`env_spacing=1.2`, SimToolReal.yaml:34 /
+# simtoolreal_env_cfg.py:572).  Layout only — every env is its own PhysX
+# subtree under replicate_physics=False — but kept identical so world-frame
+# quantities match the original environment origins.  Multi-asset scenes only;
+# the legacy single-asset path keeps its historical 2.0 (pipeline-audit.md F2).
+SIMTOOLREAL_ENV_GRID_SPACING: float = 1.2
+LEGACY_ENV_GRID_SPACING: float = 2.0
+
+
+def resolve_env_grid_spacing(entity_payloads: list[Any]) -> float:
+    """Env grid spacing for the declared scene (legacy path unchanged)."""
+    return SIMTOOLREAL_ENV_GRID_SPACING if entity_payloads else LEGACY_ENV_GRID_SPACING
+
+
+def resolve_scene_physx_kwargs(entity_payloads: list[Any]) -> dict[str, Any] | None:
+    """Scene-level PhysxCfg kwargs, or None to keep Isaac Lab defaults."""
+    return dict(SIMTOOLREAL_SCENE_PHYSX_KWARGS) if entity_payloads else None
+
 # group: "rb" (RigidBodyAPI) or "art" (ArticulationRootAPI).
 # attr_name: USD attribute path. vtype_str: matched against pxr.Sdf.ValueTypeNames.
 # scene_utils.py:136-148.
@@ -175,7 +228,7 @@ class _EntityBakePlan:
 
 
 def bake_plan_for_entity(
-    materialization: str, root_mode: str, *, is_variant_target: bool
+    materialization: str, root_mode: str, *, role: str, is_variant_target: bool
 ) -> _EntityBakePlan:
     """Return the original repository's bake plan for one entity role.
 
@@ -183,9 +236,8 @@ def bake_plan_for_entity(
       depenetration velocity, self-collisions on, articulation solver 8/0).
     - object variant pool: scene_utils.py:1707-1713 (dynamic, max
       depenetration velocity, articulation API off).
-    - table (floating rigid, not pooled): scene_utils.py:1752-1758
-      (kinematic, gravity off) — this replaces the 1.3a spawn-time floating
-      table, which fell under gravity.
+    - table (kinematic rigid): scene_utils.py:1752-1758 (kinematic, gravity
+      off, collision preserved — no ``collision_enabled`` argument).
     - goalviz (kinematic rigid): scene_utils.py:1714-1719 (kinematic, gravity
       off, collision disabled).
     """
@@ -204,6 +256,19 @@ def bake_plan_for_entity(
     if materialization != "rigid":
         raise ValueError(f"unsupported entity materialization {materialization!r}")
     if root_mode == "kinematic":
+        # The two kinematic roles differ exactly in collision: the original
+        # goalviz bake passes collision_enabled=False (scene_utils.py:1714-1719)
+        # while the table bake passes no collision flag and keeps collision
+        # (scene_utils.py:1752-1758).  Anything else is fail-closed.
+        if role == "goalviz":
+            collision_enabled: bool | None = False
+        elif role == "table":
+            collision_enabled = None
+        else:
+            raise ValueError(
+                f"unsupported kinematic rigid entity role {role!r}; the declared "
+                "multi-asset roles are robot/table/object/goalviz"
+            )
         return _EntityBakePlan(
             props={
                 "kinematic_enabled": True,
@@ -211,25 +276,20 @@ def bake_plan_for_entity(
                 "articulation_enabled": False,
             },
             apply_physx_articulation=False,
-            collision_enabled=False,
+            collision_enabled=collision_enabled,
         )
     if root_mode != "floating":
         raise ValueError(f"unsupported rigid entity root_mode {root_mode!r}")
-    if is_variant_target:
-        return _EntityBakePlan(
-            props={
-                "kinematic_enabled": False,
-                "disable_gravity": False,
-                "max_depenetration_velocity": 1000.0,
-                "articulation_enabled": False,
-            },
-            apply_physx_articulation=False,
-            collision_enabled=None,
+    if not is_variant_target:
+        raise ValueError(
+            f"unsupported non-dynamic floating rigid role {role!r}; every floating "
+            "rigid is the dynamic object contract (scene_utils.py:1701-1713)"
         )
     return _EntityBakePlan(
         props={
-            "kinematic_enabled": True,
-            "disable_gravity": True,
+            "kinematic_enabled": False,
+            "disable_gravity": False,
+            "max_depenetration_velocity": 1000.0,
             "articulation_enabled": False,
         },
         apply_physx_articulation=False,
@@ -726,6 +786,7 @@ def _verify_baked_usd(usd_path: str, plan: _EntityBakePlan) -> dict[str, int]:
         raise RuntimeError(f"No root prim in USD: {usd_path}")
 
     counts = {"rigid_body_prims": 0, "articulation_prims": 0, "collision_prims": 0}
+    collision_enabled_values: list = []
     mismatches: list[str] = []
     for prim in Usd.PrimRange(root):
         is_rb = prim.HasAPI(UsdPhysics.RigidBodyAPI)
@@ -752,6 +813,10 @@ def _verify_baked_usd(usd_path: str, plan: _EntityBakePlan) -> dict[str, int]:
                 )
         if prim.HasAPI(UsdPhysics.CollisionAPI):
             counts["collision_prims"] += 1
+            ce_observed = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr()
+            collision_enabled_values.append(
+                bool(ce_observed.Get()) if ce_observed else None
+            )
             px = PhysxSchema.PhysxCollisionAPI(prim)
             for get_attr, expected in (
                 (px.GetContactOffsetAttr, _CONTACT_OFFSET),
@@ -778,7 +843,10 @@ def _verify_baked_usd(usd_path: str, plan: _EntityBakePlan) -> dict[str, int]:
             + "; ".join(mismatches[:8])
             + (f" (+{len(mismatches) - 8} more)" if len(mismatches) > 8 else "")
         )
-    return counts
+    # Observed collisionEnabled per collision prim (pipeline-audit.md F4):
+    # recorded for probe assertions even when the plan does not pin the flag
+    # (the table plan leaves collision untouched and must stay enabled).
+    return {**counts, "collision_enabled": collision_enabled_values}
 
 
 def _verify_self_collision_filters(
@@ -1048,7 +1116,7 @@ class _WorkerContext:
         # created here, so no asset/XML parsing occurs on a hot path.  The
         # translations are private worker offsets; state is normalized back to
         # local coordinates before it is published to the host.
-        cloner = GridCloner(spacing=2.0)
+        cloner = GridCloner(spacing=resolve_env_grid_spacing(entity_payloads))
         cloner.define_base_env("/World/envs")
         self.env_prim_paths = cloner.generate_paths("/World/envs/env", self.num_envs)
         # The source Xform must exist before GridCloner.clone.  The returned
@@ -1098,7 +1166,7 @@ class _WorkerContext:
             if entity_payloads
             else "/World/envs/env_.*/Robot"
         )
-        robot_cfg = ArticulationCfg(
+        robot_cfg_kwargs: dict[str, Any] = dict(
             prim_path=robot_prim_path,
             articulation_root_prim_path=articulation_root,
             spawn=sim_utils.UsdFileCfg(usd_path=robot_usd_path),
@@ -1113,7 +1181,32 @@ class _WorkerContext:
                 )
             },
         )
-        sim_cfg = sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
+        if entity_payloads:
+            # SimToolReal multi-asset: the fixed-base robot's only root-pose
+            # source is this spawn-time state, so the original repository's
+            # standing position is applied here (pipeline-audit.md F6).  The
+            # legacy single-asset path keeps Isaac Lab defaults (MJCF scenes
+            # carry their own keyframe contract).
+            robot_cfg_kwargs["init_state"] = ArticulationCfg.InitialStateCfg(
+                pos=SIMTOOLREAL_ROBOT_INIT_POS,
+                rot=SIMTOOLREAL_ROBOT_INIT_ROT_WXYZ,
+            )
+        robot_cfg = ArticulationCfg(**robot_cfg_kwargs)
+        # Multi-asset (SimToolReal) scenes apply the original repository's
+        # scene-level PhysxCfg; the legacy single-asset path keeps Isaac Lab
+        # defaults.  Isaac Lab flattens the physx config into carb settings and
+        # PhysxSceneAPI attributes at SimulationContext construction
+        # (isaaclab/sim/simulation_context.py:261-266, 862-866; PhysicsContext
+        # consumers at isaacsim core physics_context.py:155-188).
+        scene_physx_kwargs = resolve_scene_physx_kwargs(entity_payloads)
+        if scene_physx_kwargs is not None:
+            sim_cfg = sim_utils.SimulationCfg(
+                dt=self.sim_dt,
+                device=self.device,
+                physx=sim_utils.PhysxCfg(**scene_physx_kwargs),
+            )
+        else:
+            sim_cfg = sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
         self.sim = sim_utils.SimulationContext(sim_cfg)
         if render_mode != "none":
             # Use IsaacSim's standard grid-world floor for rendered playback.
@@ -1252,6 +1345,8 @@ class _WorkerContext:
             # FilteredPairs, plus the PhysX material write/readback summary.
             meta["bake"] = self._readback_bake(entity_payloads)
             meta["friction"] = friction_meta
+            # Scene-level PhysxCfg effective values (pipeline-audit.md F1).
+            meta["scene_physx"] = self._readback_scene_physx()
             if self._variant_pool_usds is not None:
                 target_name, pool_usds = self._variant_pool_usds
                 meta["variant_assignment"] = {
@@ -1264,6 +1359,47 @@ class _WorkerContext:
                         float(value) for value in variant_pool["masses"]
                     ]
         return meta
+
+    def _readback_scene_physx(self) -> dict[str, Any]:
+        """Read the effective scene-level PhysX configuration for INIT meta.
+
+        Isaac Lab applies ``SimulationCfg.physx`` onto the stage's
+        PhysxSceneAPI (iteration clamps/thresholds via
+        ``SimulationContext._set_physics_engine_settings``; GPU contact stream
+        buffers and thresholds via ``PhysicsContext`` setters), so reading the
+        prim back proves the original repository's scene-level configuration
+        took effect (pipeline-audit.md F1 verification).  ``solver_type`` is
+        only authored for PGS, so a missing attribute means the TGS default.
+        """
+        from pxr import PhysxSchema  # type: ignore[import-not-found]
+
+        scene_prim = self.robot.stage.GetPrimAtPath(self._physics_scene_path())
+        api = PhysxSchema.PhysxSceneAPI(scene_prim)
+        strict_readers = {
+            "min_position_iteration_count": api.GetMinPositionIterationCountAttr,
+            "max_position_iteration_count": api.GetMaxPositionIterationCountAttr,
+            "min_velocity_iteration_count": api.GetMinVelocityIterationCountAttr,
+            "max_velocity_iteration_count": api.GetMaxVelocityIterationCountAttr,
+            "bounce_threshold_velocity": api.GetBounceThresholdAttr,
+            "friction_offset_threshold": api.GetFrictionOffsetThresholdAttr,
+            "friction_correlation_distance": api.GetFrictionCorrelationDistanceAttr,
+            "gpu_max_rigid_contact_count": api.GetGpuMaxRigidContactCountAttr,
+            "gpu_max_rigid_patch_count": api.GetGpuMaxRigidPatchCountAttr,
+        }
+        readback: dict[str, Any] = {}
+        for name, getter in strict_readers.items():
+            attr = getter()
+            value = attr.Get() if attr is not None else None
+            if value is None:
+                raise RuntimeError(
+                    f"scene PhysX readback missing {name!r}; the scene-level "
+                    "SimulationCfg.physx configuration did not apply"
+                )
+            readback[name] = value
+        solver_attr = api.GetSolverTypeAttr()
+        solver_value = solver_attr.Get() if solver_attr is not None else None
+        readback["solver_type"] = "default_tgs" if solver_value is None else solver_value
+        return readback
 
     def _physics_scene_path(self) -> str:
         """Find the stage's PhysX scene prim on the materialization path."""
@@ -1513,7 +1649,9 @@ class _WorkerContext:
                     usd_path,
                     # A floating rigid role is the dynamic object contract;
                     # table/goalviz use the explicit kinematic root mode.
-                    bake_plan_for_entity(materialization, root_mode, is_variant_target=True),
+                    bake_plan_for_entity(
+                        materialization, root_mode, role=name, is_variant_target=True
+                    ),
                 )
                 entry["_usd_path"] = usd_path
                 robot_entry, robot_usd_path = entry, usd_path
@@ -1547,7 +1685,9 @@ class _WorkerContext:
                 for pool_usd in pool_usds:
                     _bake_usd_in_place(
                         pool_usd,
-                        bake_plan_for_entity(materialization, root_mode, is_variant_target=True),
+                        bake_plan_for_entity(
+                            materialization, root_mode, role=name, is_variant_target=True
+                        ),
                     )
                 assignments = pool["assignments"]
                 # ``MultiUsdFileCfg(random_choice=False)`` itself selects
@@ -1569,9 +1709,32 @@ class _WorkerContext:
                 # all physics is authored by the bake above.
                 spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
             elif root_mode == "kinematic":
-                # Goalviz: object-style conversion (the original bakes from
-                # the object USDs, scene_utils.py:1714-1719); the bake authors
-                # kinematic/gravity and collisionEnabled=False.
+                # Goalviz converts object-style (the original bakes from the
+                # object USDs, scene_utils.py:1714-1719); the table converts
+                # with the default flag, capsules=False (scene_utils.py:1752).
+                # The bake authors kinematic/gravity and, for the goalviz
+                # only, collisionEnabled=False.
+                usd_path = self._convert_entity_urdf(
+                    os.fspath(entry["model_file"]),
+                    fix_base=False,
+                    self_collision=None,
+                    with_joint_drive=False,
+                    replace_cylinders_with_capsules=(name == "goalviz"),
+                )
+                _bake_usd_in_place(
+                    usd_path,
+                    bake_plan_for_entity(
+                        materialization, root_mode, role=name, is_variant_target=False
+                    ),
+                )
+                entry["_usd_path"] = usd_path
+                spawn = UsdFileCfg(usd_path=usd_path)
+            else:
+                # Floating rigid (object role): author dynamic rigid-body
+                # physics. Table and goalviz use the explicit kinematic mode.
+                # The object converts with capsule replacement like the pool
+                # variants (scene_utils.py:1701-1706 applies to every object
+                # conversion, pooled or not).
                 usd_path = self._convert_entity_urdf(
                     os.fspath(entry["model_file"]),
                     fix_base=False,
@@ -1581,23 +1744,9 @@ class _WorkerContext:
                 )
                 _bake_usd_in_place(
                     usd_path,
-                    bake_plan_for_entity(materialization, root_mode, is_variant_target=False),
-                )
-                entry["_usd_path"] = usd_path
-                spawn = UsdFileCfg(usd_path=usd_path)
-            else:
-                # Floating rigid (object role): author dynamic rigid-body
-                # physics. Table and goalviz use the explicit kinematic mode.
-                usd_path = self._convert_entity_urdf(
-                    os.fspath(entry["model_file"]),
-                    fix_base=False,
-                    self_collision=None,
-                    with_joint_drive=False,
-                    replace_cylinders_with_capsules=False,
-                )
-                _bake_usd_in_place(
-                    usd_path,
-                    bake_plan_for_entity(materialization, root_mode, is_variant_target=True),
+                    bake_plan_for_entity(
+                        materialization, root_mode, role=name, is_variant_target=True
+                    ),
                 )
                 entry["_usd_path"] = usd_path
                 spawn = UsdFileCfg(usd_path=usd_path)
@@ -1685,10 +1834,22 @@ class _WorkerContext:
 
         stiffness = env0(actuator.stiffness)[self.native_joint_for_contract]
         damping = env0(actuator.damping)[self.native_joint_for_contract]
-        return {
+        report: dict[str, list[float]] = {
             "stiffness": [float(value) for value in stiffness],
             "damping": [float(value) for value in damping],
         }
+        # Armature and effort limits are applied through the same override
+        # channel; record their effective values so probes can close the
+        # readback loop (pipeline-audit.md S05).
+        armature = getattr(actuator, "armature", None)
+        effort = getattr(actuator, "effort_limit_sim", None)
+        for name, values in (("armature", armature), ("effort_limit", effort)):
+            if values is None:
+                raise RuntimeError(
+                    f"IsaacLab actuator does not expose {name!r}; cannot read back gains"
+                )
+            report[name] = [float(value) for value in env0(values)[self.native_joint_for_contract]]
+        return report
 
     def _apply_friction_writes(self, entity_payloads: list[dict[str, Any]]) -> dict[str, Any]:
         """Write INIT-declared contact materials through the PhysX views.
@@ -1788,6 +1949,7 @@ class _WorkerContext:
             plan = bake_plan_for_entity(
                 str(entry["materialization"]),
                 str(entry["root_mode"]),
+                role=name,
                 is_variant_target=is_pool_target or is_dynamic_rigid,
             )
             if is_pool_target:
