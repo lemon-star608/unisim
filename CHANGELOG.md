@@ -28,6 +28,28 @@
 - Playback model resolution no longer maps per-env variant geom sizes: one visual model file (or one saved mjb) serves every rendered env, and `materialize_visual_playback_model` is removed from the mujoco package exports.
 ## Unreleased
 
+- **Table collision preserved in the multi-asset bake (F4/F5).**  The isaacsim
+  worker's shared kinematic bake plan used to disable collision for every
+  kinematic rigid, so the table — the task's only support surface — generated
+  no contacts and objects fell through it.  `bake_plan_for_entity` now takes
+  the declared role: the table bake leaves collision enabled
+  (scene_utils.py:1752-1758) while the goalviz bake keeps
+  `collisionEnabled=False` (scene_utils.py:1714-1719), unknown kinematic roles
+  fail closed, and floating rigids are always the dynamic object contract.
+  The table converts with the original's default cylinder flag and bootstrap
+  objects convert with capsule replacement like the pool variants
+  (scene_utils.py:1701-1706).  Bake readbacks now record per-prim
+  `collisionEnabled` values for probe assertions.
+
+- **Scene-level PhysX configuration for multi-asset scenes (F1/F2).**  The
+  isaacsim worker now constructs `SimulationCfg` with the original repository's
+  `PhysxCfg` (solver TGS, iteration clamps 8/8 and 0/0, bounce threshold 0.2,
+  GPU contact stream buffers 2**24/2**23) and clones the env grid at
+  `env_spacing=1.2` whenever the INIT payload declares rigid entities; the
+  legacy single-asset path keeps Isaac Lab defaults and its historical spacing.
+  A fail-closed `scene_physx` INIT-meta readback (PhysxSceneAPI attributes)
+  lets probes assert the effective scene configuration.
+
 - **Manager reset routing for rigid entity roots.**  The public backend contract
   now exposes materialized independent rigid-root names, and the UniLab reset
   transaction routes table/object/goalviz root writes through the corresponding

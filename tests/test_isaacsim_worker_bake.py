@@ -74,7 +74,9 @@ def sharpa_like_file(tmp_path):
 
 def test_bake_plan_robot_articulation():
     # scene_utils.py:1730-1739.
-    plan = bake_plan_for_entity("articulation", "fixed", is_variant_target=False)
+    plan = bake_plan_for_entity(
+        "articulation", "fixed", role="robot", is_variant_target=False
+    )
     assert plan.props == {
         "disable_gravity": True,
         "max_depenetration_velocity": 1000.0,
@@ -85,12 +87,15 @@ def test_bake_plan_robot_articulation():
     assert plan.apply_physx_articulation is True
     assert plan.collision_enabled is None
     # Floating articulation roots take the same robot bake.
-    assert bake_plan_for_entity("articulation", "floating", is_variant_target=False) == plan
+    assert (
+        bake_plan_for_entity("articulation", "floating", role="robot", is_variant_target=False)
+        == plan
+    )
 
 
 def test_bake_plan_object_variant_target():
     # scene_utils.py:1707-1713.
-    plan = bake_plan_for_entity("rigid", "floating", is_variant_target=True)
+    plan = bake_plan_for_entity("rigid", "floating", role="object", is_variant_target=True)
     assert plan.props == {
         "kinematic_enabled": False,
         "disable_gravity": False,
@@ -101,9 +106,11 @@ def test_bake_plan_object_variant_target():
     assert plan.collision_enabled is None
 
 
-def test_bake_plan_table_floating_rigid():
-    # scene_utils.py:1752-1758 (kinematic table; solves the 1.3a free-fall).
-    plan = bake_plan_for_entity("rigid", "floating", is_variant_target=False)
+def test_bake_plan_table_kinematic_keeps_collision():
+    # scene_utils.py:1752-1758: the table bake passes no collision flag, so
+    # collision stays enabled — the support surface must contact the object
+    # (pipeline-audit.md F4: a shared kinematic plan used to disable it).
+    plan = bake_plan_for_entity("rigid", "kinematic", role="table", is_variant_target=False)
     assert plan.props == {
         "kinematic_enabled": True,
         "disable_gravity": True,
@@ -113,9 +120,9 @@ def test_bake_plan_table_floating_rigid():
     assert plan.collision_enabled is None
 
 
-def test_bake_plan_goalviz_kinematic():
+def test_bake_plan_goalviz_kinematic_disables_collision():
     # scene_utils.py:1714-1719.
-    plan = bake_plan_for_entity("rigid", "kinematic", is_variant_target=False)
+    plan = bake_plan_for_entity("rigid", "kinematic", role="goalviz", is_variant_target=False)
     assert plan.props == {
         "kinematic_enabled": True,
         "disable_gravity": True,
@@ -127,9 +134,18 @@ def test_bake_plan_goalviz_kinematic():
 
 def test_bake_plan_rejects_unknown_roles():
     with pytest.raises(ValueError, match="materialization"):
-        bake_plan_for_entity("deformable", "floating", is_variant_target=False)
+        bake_plan_for_entity(
+            "deformable", "floating", role="object", is_variant_target=False
+        )
     with pytest.raises(ValueError, match="root_mode"):
-        bake_plan_for_entity("rigid", "fixed", is_variant_target=False)
+        bake_plan_for_entity("rigid", "fixed", role="object", is_variant_target=False)
+    # Kinematic rigids are exactly table (collision preserved) and goalviz
+    # (collision disabled); anything else is fail-closed.
+    with pytest.raises(ValueError, match="kinematic rigid entity role"):
+        bake_plan_for_entity("rigid", "kinematic", role="tray", is_variant_target=False)
+    # Floating rigids are always the dynamic object contract.
+    with pytest.raises(ValueError, match="floating rigid"):
+        bake_plan_for_entity("rigid", "floating", role="table", is_variant_target=False)
 
 
 def test_adjacency_plain_chain_has_no_distance_two_pairs(tmp_path):
