@@ -2,6 +2,129 @@
 
 ## Unreleased
 
+- **Manager reset routing for rigid entity roots.**  The public backend contract
+  now exposes materialized independent rigid-root names, and the UniLab reset
+  transaction routes table/object/goalviz root writes through the corresponding
+  `entity_root_states` slots instead of overwriting the articulation qpos/qvel
+  root.  This fixes false per-step fall terminations and preserves the
+  goalviz-only reset isolation promised by the multi-root IPC contract.
+
+- **Kit-verified rigid-root wrench path (SimToolReal 1.3d/1.4s).** Floating rigid
+  bootstrap objects now use the dynamic bake plan even without a variant pool;
+  rigid entity roots expose the public 7+6 reset layout; and the dense wrench
+  slots are applied to each IsaacLab `RigidObject` on every physics substep and
+  cleared after the control step. The D2 probe verifies root isolation,
+  kinematic goalviz stability, and a world-frame force displacement in IsaacSim.
+
+- **Multi-root IPC slots for rigid scene entities (SimToolReal step 1.3c).**
+  `subprocess_ipc.protocol.slot_shapes` gains an optional `rigid_root_entities`
+  parameter: each declared rigid entity (`materialization="rigid"`) owns one
+  read slot `entity_root_state__<name>` ((num_envs, 13): pos xyz, quat wxyz,
+  world linear and angular velocity, batch-first, host local frame) and one
+  write slot `entity_reset_state__<name>` (same layout) consumed by
+  `SET_STATE`.  Legacy single-articulation scenes are byte-identical:
+  `SLOT_NAMES`, the base `slot_shapes` dict, and the legacy
+  `{"count": count}` SET_STATE payload are unchanged, and the new keys are
+  allocated and sent only when the scene declares rigid entities (the mujoco
+  family shares `protocol.py` and this host class, so every new behavior is
+  gated on `entity_assets`).  At INIT-metadata binding the host cross-checks
+  the worker's rigid entity list against the declared specs fail-closed and
+  maps each entity's scanned root body name to an extended body id
+  (`num_bodies + declaration index`), so `get_body_ids` /
+  `get_body_pos_w/quat_w/lin_vel_w/ang_vel_w` / `get_body_state_w` route
+  rigid roots (e.g. `object_root`, `goalviz_root`) to the new slots while
+  robot bodies keep the `body_state` slot; name collisions, worker/host
+  entity mismatches, and out-of-range ids all fail closed.  `set_state`
+  accepts keyword-only `entity_root_states` and now allows `qpos`/`qvel` to
+  be omitted as a pair: one SET_STATE command is one transaction over the
+  same env rows, and a goalviz-only reset (`robot=False`) cannot perturb
+  object or robot state (DESIGN.md §4).  Host and worker both validate
+  shapes and finiteness of qpos/qvel/entity states; the worker publishes
+  rigid root states on every refresh with a finite check, verifies the
+  attached entity slot set against its materialized rigid objects at
+  ATTACH, and writes entity roots through `write_root_pose_to_sim` /
+  `write_root_link_velocity_to_sim` (world-frame velocities, env-origin
+  translations added back worker-side).  Fixed-base robot root reads stay
+  fail-closed (decision 1.1-c).
+- **IsaacSim worker USD bake, self-collision filters, and runtime contact
+  materials (SimToolReal step 1.3b).**  All role physics is now authored into
+  the converted USD before spawn (`_bake_usd_in_place` + `bake_plan_for_entity`,
+  a literal port of the original repository's `_bake_usd` family: robot
+  gravity-off/self-collisions-on/articulation solver 8/0, dynamic tool-pool
+  variants, kinematic gravity-off table and goalviz with
+  `collisionEnabled=False`, plus PhysX contact/rest offsets on every collision
+  prim), so rigid spawns use plain `UsdFileCfg`/`MultiUsdFileCfg` exactly like
+  the original `build_rigid_object_cfg`.  The robot USD gains
+  `FilteredPairsAPI` for adjacent link pairs derived from URDF structure
+  (`compute_adjacent_link_pairs`: fixed-joint merge graph, distance-2 pairs
+  through `_VL` spacers; pair-exact with the original `adjacent_links.py` LEFT
+  map on the Sharpa hand), replacing the task-side data file.  Contact
+  friction becomes an opt-in cold-path channel: `SceneEntitySpec` gains
+  `contact_friction` (PhysX static/dynamic/restitution triple) and
+  articulation-only `contact_friction_by_body` (`BodyFrictionOverride`),
+  validated at construction (finite non-negative triples, no duplicates,
+  overrides require a default) and cross-checked against scanned body names in
+  `scan_scene_entities`; the host serializes them into the INIT entity payload
+  only when declared, so legacy scenes stay byte-identical.  After the first
+  `sim.reset()` the worker writes materials through each entity's
+  `root_physx_view` (default tiled across all shapes, per-body overrides on
+  their link's shape slice with the original per-link shape-count consistency
+  check; the per-env bucketed friction DR is not migrated), reads the view
+  back, and fails INIT on any mismatch.  INIT meta gains a fail-closed `bake`
+  readback (re-opens every baked USD and verifies the plan attributes,
+  contact/rest offsets, `collisionEnabled`, and the robot's FilteredPairs
+  against the URDF-derived adjacency) and a `friction` summary (per-entity
+  unique material values, shape counts, verification flag) for probes.
+- **IsaacSim worker multi-asset spawn + variant pools (SimToolReal step
+  1.3a).**  When the scene declares `SceneCfg.entity_assets`, the worker now
+  materializes one `Articulation` (the single articulation entity, URDF
+  converted with the original repository's flag family: `fix_base` from
+  `root_mode`, `merge_fixed_joints=True`, `self_collision=True`, zero-gain
+  force position `joint_drive`, `force_usd_conversion=True`, plus the
+  `ArticulationRootAPI` patch) and one `RigidObject` per rigid entity
+  (floating roots stay dynamic; kinematic roots spawn with
+  `kinematic_enabled=True`/`disable_gravity=True` and a
+  `collisionEnabled=False` pre-bake of the converted physics layer — the
+  probe-C-verified goalviz exception).  The subprocess host gains
+  `apply_init_randomization` for whole-file URDF variant pools: validation
+  (`build_init_variant_pool_payload`) fails closed on geom-only variants,
+  non-URDF sources, undeclared/non-rigid/non-floating targets, missing files,
+  and malformed `model_assignments`; the validated pool rides INIT as
+  `variant_pool` and the worker converts each source URDF once
+  (`fix_base=False`, `replace_cylinders_with_capsules=True`) and spawns it
+  through `MultiUsdFileCfg(random_choice=False)` with the per-env resolved
+  list, so arbitrary assignments are honored while reset never recompiles or
+  reassigns.  Per-entity actuator gain tables from the entity payload now land
+  on the robot's `ImplicitActuator` (INIT meta carries an env-0 readback).
+  Applying a plan after materialization, or twice, fails closed; backends
+  without worker support (isaacgym) fail closed via
+  `_SUPPORTS_INIT_MODEL_VARIANTS`.  `SceneMetadata` gains
+  `urdf_root_link_name`, and entity INIT payloads now name the scanned URDF
+  root link for fixed-base assets (previously `None`, which blocked the
+  worker's articulation-root patch).  Legacy single-asset MJCF/URDF scenes are
+  byte-identical (empty `entities`, no `variant_pool` key).
+- **Contract/host extensions for multi-asset URDF scenes (SimToolReal step
+  1.2).**  `ModelVariantSpec` gains whole-file variant fields
+  `source_model_file` + `source_format` (paired, fail-closed outside
+  `urdf`/`mjcf`, mutually exclusive with `geom_size_overrides`) and an
+  optional `target_entity` naming the scene role the file replaces; the
+  MuJoCo adapter now fails closed on whole-file variants instead of silently
+  compiling identical models.  `SceneCfg` gains typed `entity_assets`
+  (`SceneEntitySpec`: role name, `model_file`, `asset_format`,
+  `materialization` articulation/rigid, `root_mode` fixed/floating/kinematic,
+  and per-joint `ActuatorGainOverride` tables); the legacy `entities`
+  passthrough stays owner-level and unchanged.  The subprocess host scans
+  every declared entity on the cold path (`scan_scene_entities`), deriving
+  `fixed_base` per role — URDF roots take the declared converter flag
+  (floating roots report the URDF root link as `freejoint_body_name`), MJCF
+  declarations are cross-checked against the scanned free joint — and
+  validates owner gain tables against scanned joint names fail-closed.  INIT
+  gains an `entities` list carrying per-role asset/fixed_base/actuation
+  payloads, and the top-level `dof_stiffness`/`dof_damping`/`dof_armature`/
+  `dof_friction` arrays apply the primary entity's gain overrides, so URDF
+  actuators are no longer forced to zero gains when the owner supplies a
+  table.  Legacy single-asset MJCF/URDF behavior is unchanged; worker-side
+  consumption of the new payload fields is step 1.3.
 - **IsaacSim adapter: minimal URDF scene entry (SimToolReal step 0).**
   `scene.model_file` may now point to a `.urdf`: the worker dispatches to
   Isaac Lab's `UrdfConverter` (payload-controlled `fix_base`,

@@ -575,6 +575,14 @@ class MuJoCoBackend(SimBackend):
         variants = tuple(variant_specs)
         if not variants:
             return tuple()
+        for variant in variants:
+            if variant.source_model_file is not None:
+                raise NotImplementedError(
+                    "MuJoCo model variants support geom_size_overrides only; "
+                    "whole-file variants "
+                    f"(source_model_file={variant.source_model_file!r}) need a "
+                    "backend with file-level variant materialization"
+                )
         if isinstance(self._model_file, mujoco.MjModel):
             raise ValueError(
                 "MuJoCo model variants are not supported for precompiled materialized scenes"
