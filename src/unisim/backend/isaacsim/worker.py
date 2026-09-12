@@ -2066,54 +2066,104 @@ class _WorkerContext:
                 )
         self.refresh_state_slots()
 
-    def _state_tensors(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _state_tensors(
+        self, env_ids: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         data = self.robot.data
-        root = _tensor_numpy(data.root_link_state_w)
-        dof_pos = _tensor_numpy(data.joint_pos)
-        dof_vel = _tensor_numpy(data.joint_vel)
-        body = _tensor_numpy(data.body_link_state_w)
-        if root.shape != (self.num_envs, 13):
+        if env_ids is None:
+            row_index = None
+            row_count = self.num_envs
+        else:
+            ids = np.asarray(env_ids, dtype=np.int64)
+            if ids.ndim != 1:
+                raise ValueError(f"state refresh environment ids must be 1-D, got {ids.shape}")
+            if np.unique(ids).size != ids.size:
+                raise ValueError("state refresh environment ids must not contain duplicates")
+            if np.any(ids < 0) or np.any(ids >= self.num_envs):
+                raise ValueError("state refresh environment ids are out of range")
+            row_index = self.torch.as_tensor(ids, dtype=self.torch.long, device=self.device)
+            row_count = int(ids.size)
+
+        def select_rows(value: Any) -> Any:
+            if row_index is None:
+                return value
+            return value.index_select(0, row_index)
+
+        # Select rows while they are still device tensors. The full path stays
+        # equivalent; the selected path avoids transferring untouched rows
+        # across the IsaacSim/NumPy boundary.
+        root = _tensor_numpy(select_rows(data.root_link_state_w))
+        dof_pos = _tensor_numpy(select_rows(data.joint_pos))
+        dof_vel = _tensor_numpy(select_rows(data.joint_vel))
+        body = _tensor_numpy(select_rows(data.body_link_state_w))
+        if root.shape != (row_count, 13):
             raise RuntimeError(
-                f"IsaacLab root state shape is {root.shape}, expected ({self.num_envs}, 13)"
+                f"IsaacLab root state shape is {root.shape}, expected ({row_count}, 13)"
             )
         # Return root, dof(pos/vel), body separately; body is reordered below.
         dof = np.stack((dof_pos, dof_vel), axis=-1)
         return root, dof, body
 
-    def refresh_state_slots(self) -> None:
-        root, dof, body = self._state_tensors()
+    def refresh_state_slots(self, env_ids: np.ndarray | None = None) -> None:
+        root, dof, body = self._state_tensors(env_ids)
+        selected = env_ids is not None
+        ids = None if env_ids is None else np.asarray(env_ids, dtype=np.int64)
+        row_index = (
+            None
+            if ids is None
+            else self.torch.as_tensor(ids, dtype=self.torch.long, device=self.device)
+        )
         # IsaacLab reports world-frame positions.  Remove the private clone
         # translation before publishing UniLab's local-frame state.
         root = root.copy()
         body = body.copy()
-        root[:, :3] -= self.env_origins
-        body[:, :, :3] -= self.env_origins[:, None, :]
-        np.copyto(self.slots["root_state"], root)
-        np.copyto(self.slots["dof_state"], dof[:, self.native_joint_for_contract, :])
-        np.copyto(self.slots["body_state"], body[:, self.native_body_for_contract, :])
+        origins = self.env_origins if ids is None else self.env_origins[ids]
+        root[:, :3] -= origins
+        body[:, :, :3] -= origins[:, None, :]
+        if selected:
+            assert ids is not None
+            self.slots["root_state"][ids] = root
+            self.slots["dof_state"][ids] = dof[:, self.native_joint_for_contract, :]
+            self.slots["body_state"][ids] = body[:, self.native_body_for_contract, :]
+        else:
+            np.copyto(self.slots["root_state"], root)
+            np.copyto(self.slots["dof_state"], dof[:, self.native_joint_for_contract, :])
+            np.copyto(self.slots["body_state"], body[:, self.native_body_for_contract, :])
         # IsaacLab's Articulation tensor does not expose a generic net-contact
         # force slot.  Keep the slot deterministic and let the host sensor map
         # fail closed for contact declarations.
-        self.slots["contact_force"].fill(0.0)
+        if selected:
+            assert ids is not None
+            self.slots["contact_force"][ids] = 0.0
+        else:
+            self.slots["contact_force"].fill(0.0)
         # Rigid scene entities (1.3c): publish each root's world state (pos
         # xyz, quat wxyz, lin vel, world ang vel) in local frame.  The loop is
         # empty for legacy single-asset scenes.
         for name, rigid in self.rigid_objects.items():
-            state = _tensor_numpy(rigid.data.root_link_state_w)
-            expected = (self.num_envs, 13)
+            rigid_state = rigid.data.root_link_state_w
+            if row_index is not None:
+                rigid_state = rigid_state.index_select(0, row_index)
+            state = _tensor_numpy(rigid_state)
+            row_count = self.num_envs if ids is None else int(ids.size)
+            expected = (row_count, 13)
             if state.shape != expected:
                 raise RuntimeError(
                     f"IsaacLab rigid entity {name!r} root state shape is {state.shape}, "
                     f"expected {expected}"
                 )
             state = state.copy()
-            state[:, :3] -= self.env_origins
+            state[:, :3] -= origins
             if not np.isfinite(state).all():
                 raise RuntimeError(
                     f"IsaacLab rigid entity {name!r} root state contains NaN or Inf; "
                     "refusing to publish non-finite state"
                 )
-            np.copyto(self.slots[self.protocol.entity_root_state_slot(name)], state)
+            if selected:
+                assert ids is not None
+                self.slots[self.protocol.entity_root_state_slot(name)][ids] = state
+            else:
+                np.copyto(self.slots[self.protocol.entity_root_state_slot(name)], state)
 
     def step(self, payload: dict[str, Any]) -> dict[str, Any]:
         ctrl = np.asarray(self.slots["ctrl"], dtype=np.float32)
@@ -2264,7 +2314,7 @@ class _WorkerContext:
             rigid.reset(env_ids)
             rigid.update(self.sim_dt)
         t0 = time.perf_counter()
-        self.refresh_state_slots()
+        self.refresh_state_slots(env_ids_np)
         return {
             "timing": {
                 "set_state_reset_upload_ms": 0.0,
