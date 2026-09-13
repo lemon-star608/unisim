@@ -202,6 +202,7 @@ def resolve_scene_physx_kwargs(entity_payloads: list[Any]) -> dict[str, Any] | N
     """Scene-level PhysxCfg kwargs, or None to keep Isaac Lab defaults."""
     return dict(SIMTOOLREAL_SCENE_PHYSX_KWARGS) if entity_payloads else None
 
+
 # group: "rb" (RigidBodyAPI) or "art" (ArticulationRootAPI).
 # attr_name: USD attribute path. vtype_str: matched against pxr.Sdf.ValueTypeNames.
 # scene_utils.py:136-148.
@@ -814,9 +815,7 @@ def _verify_baked_usd(usd_path: str, plan: _EntityBakePlan) -> dict[str, int]:
         if prim.HasAPI(UsdPhysics.CollisionAPI):
             counts["collision_prims"] += 1
             ce_observed = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr()
-            collision_enabled_values.append(
-                bool(ce_observed.Get()) if ce_observed else None
-            )
+            collision_enabled_values.append(bool(ce_observed.Get()) if ce_observed else None)
             px = PhysxSchema.PhysxCollisionAPI(prim)
             for get_attr, expected in (
                 (px.GetContactOffsetAttr, _CONTACT_OFFSET),
@@ -916,6 +915,11 @@ def _verify_self_collision_filters(
 
 
 class _WorkerContext:
+    # Detail-timing flag reads must tolerate ``__new__``-built contexts (unit
+    # tests) that bypass ``__init__``; the env-var assignment below overrides
+    # this default for real workers.
+    _profile_detail: bool = False
+
     def __init__(self, protocol: Any) -> None:
         self.protocol = protocol
         self.num_envs = 0
@@ -959,6 +963,13 @@ class _WorkerContext:
         self.collision_filtering_applied = False
         self.slots: dict[str, np.ndarray] = {}
         self._shm_handles: list[Any] = []
+        self._profile_detail = os.environ.get("UNISIM_PROFILE_DETAIL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._last_refresh_timing_ms: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Cold-path materialization
@@ -1566,8 +1577,10 @@ class _WorkerContext:
                 f"got {assignments}"
             )
         if masses is not None:
-            if len(masses) != len(source_files) or not np.isfinite(masses).all() or any(
-                value < 0.0 for value in masses
+            if (
+                len(masses) != len(source_files)
+                or not np.isfinite(masses).all()
+                or any(value < 0.0 for value in masses)
             ):
                 raise ValueError(
                     "isaacsim INIT variant pool masses must contain one finite non-negative "
@@ -1700,9 +1713,11 @@ class _WorkerContext:
                 round_robin = assignments == [
                     index % len(pool_usds) for index in range(self.num_envs)
                 ]
-                spawn_usds = pool_usds if round_robin else [
-                    pool_usds[assignments[index]] for index in range(self.num_envs)
-                ]
+                spawn_usds = (
+                    pool_usds
+                    if round_robin
+                    else [pool_usds[assignments[index]] for index in range(self.num_envs)]
+                )
                 entry["_usd_path"] = spawn_usds
                 self._variant_pool_usds = (name, pool_usds)
                 # scene_utils.py:187-192: plain MultiUsdFileCfg round-robin;
@@ -1943,8 +1958,7 @@ class _WorkerContext:
             # original pool call site, so mirror the materialization branch
             # here to keep readback fail-closed for the non-pool object too.
             is_dynamic_rigid = (
-                str(entry["materialization"]) == "rigid"
-                and str(entry["root_mode"]) == "floating"
+                str(entry["materialization"]) == "rigid" and str(entry["root_mode"]) == "floating"
             )
             plan = bake_plan_for_entity(
                 str(entry["materialization"]),
@@ -2067,7 +2081,9 @@ class _WorkerContext:
         self.refresh_state_slots()
 
     def _state_tensors(
-        self, env_ids: np.ndarray | None = None
+        self,
+        env_ids: np.ndarray | None = None,
+        timing: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         data = self.robot.data
         if env_ids is None:
@@ -2092,20 +2108,37 @@ class _WorkerContext:
         # Select rows while they are still device tensors. The full path stays
         # equivalent; the selected path avoids transferring untouched rows
         # across the IsaacSim/NumPy boundary.
+        t0 = time.perf_counter()
         root = _tensor_numpy(select_rows(data.root_link_state_w))
+        if timing is not None:
+            timing["refresh_root_tensor_to_host_ms"] = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
         dof_pos = _tensor_numpy(select_rows(data.joint_pos))
+        if timing is not None:
+            timing["refresh_joint_pos_tensor_to_host_ms"] = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
         dof_vel = _tensor_numpy(select_rows(data.joint_vel))
+        if timing is not None:
+            timing["refresh_joint_vel_tensor_to_host_ms"] = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
         body = _tensor_numpy(select_rows(data.body_link_state_w))
+        if timing is not None:
+            timing["refresh_body_tensor_to_host_ms"] = (time.perf_counter() - t0) * 1000.0
         if root.shape != (row_count, 13):
             raise RuntimeError(
                 f"IsaacLab root state shape is {root.shape}, expected ({row_count}, 13)"
             )
         # Return root, dof(pos/vel), body separately; body is reordered below.
+        t0 = time.perf_counter()
         dof = np.stack((dof_pos, dof_vel), axis=-1)
+        if timing is not None:
+            timing["refresh_joint_stack_ms"] = (time.perf_counter() - t0) * 1000.0
         return root, dof, body
 
     def refresh_state_slots(self, env_ids: np.ndarray | None = None) -> None:
-        root, dof, body = self._state_tensors(env_ids)
+        detail_timing: dict[str, float] | None = {} if self._profile_detail else None
+        refresh_t0 = time.perf_counter()
+        root, dof, body = self._state_tensors(env_ids, detail_timing)
         selected = env_ids is not None
         ids = None if env_ids is None else np.asarray(env_ids, dtype=np.int64)
         row_index = (
@@ -2115,11 +2148,15 @@ class _WorkerContext:
         )
         # IsaacLab reports world-frame positions.  Remove the private clone
         # translation before publishing UniLab's local-frame state.
+        t0 = time.perf_counter()
         root = root.copy()
         body = body.copy()
         origins = self.env_origins if ids is None else self.env_origins[ids]
         root[:, :3] -= origins
         body[:, :, :3] -= origins[:, None, :]
+        if detail_timing is not None:
+            detail_timing["refresh_robot_frame_normalize_ms"] = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
         if selected:
             assert ids is not None
             self.slots["root_state"][ids] = root
@@ -2129,22 +2166,32 @@ class _WorkerContext:
             np.copyto(self.slots["root_state"], root)
             np.copyto(self.slots["dof_state"], dof[:, self.native_joint_for_contract, :])
             np.copyto(self.slots["body_state"], body[:, self.native_body_for_contract, :])
+        if detail_timing is not None:
+            detail_timing["refresh_robot_slot_copy_ms"] = (time.perf_counter() - t0) * 1000.0
         # IsaacLab's Articulation tensor does not expose a generic net-contact
         # force slot.  Keep the slot deterministic and let the host sensor map
         # fail closed for contact declarations.
+        t0 = time.perf_counter()
         if selected:
             assert ids is not None
             self.slots["contact_force"][ids] = 0.0
         else:
             self.slots["contact_force"].fill(0.0)
+        if detail_timing is not None:
+            detail_timing["refresh_contact_slot_clear_ms"] = (time.perf_counter() - t0) * 1000.0
         # Rigid scene entities (1.3c): publish each root's world state (pos
         # xyz, quat wxyz, lin vel, world ang vel) in local frame.  The loop is
         # empty for legacy single-asset scenes.
         for name, rigid in self.rigid_objects.items():
+            rigid_t0 = time.perf_counter()
             rigid_state = rigid.data.root_link_state_w
             if row_index is not None:
                 rigid_state = rigid_state.index_select(0, row_index)
             state = _tensor_numpy(rigid_state)
+            if detail_timing is not None:
+                detail_timing[f"refresh_rigid_{name}_tensor_to_host_ms"] = (
+                    time.perf_counter() - rigid_t0
+                ) * 1000.0
             row_count = self.num_envs if ids is None else int(ids.size)
             expected = (row_count, 13)
             if state.shape != expected:
@@ -2152,6 +2199,7 @@ class _WorkerContext:
                     f"IsaacLab rigid entity {name!r} root state shape is {state.shape}, "
                     f"expected {expected}"
                 )
+            rigid_t0 = time.perf_counter()
             state = state.copy()
             state[:, :3] -= origins
             if not np.isfinite(state).all():
@@ -2164,8 +2212,17 @@ class _WorkerContext:
                 self.slots[self.protocol.entity_root_state_slot(name)][ids] = state
             else:
                 np.copyto(self.slots[self.protocol.entity_root_state_slot(name)], state)
+            if detail_timing is not None:
+                detail_timing[f"refresh_rigid_{name}_normalize_slot_ms"] = (
+                    time.perf_counter() - rigid_t0
+                ) * 1000.0
+        if detail_timing is not None:
+            detail_timing["refresh_total_ms"] = (time.perf_counter() - refresh_t0) * 1000.0
+            self._last_refresh_timing_ms = detail_timing
 
     def step(self, payload: dict[str, Any]) -> dict[str, Any]:
+        worker_step_t0 = time.perf_counter()
+        control_t0 = time.perf_counter()
         ctrl = np.asarray(self.slots["ctrl"], dtype=np.float32)
         if ctrl.shape != (self.num_envs, self.num_dof):
             raise ValueError(
@@ -2175,36 +2232,75 @@ class _WorkerContext:
         native_target[:, self.native_joint_for_contract] = ctrl
         target = _to_tensor(self.torch, native_target, self.device)
         self.robot.set_joint_position_target(target)
+        control_prepare_ms = (time.perf_counter() - control_t0) * 1000.0
         nsteps = int(payload["nsteps"])
         if nsteps <= 0:
             raise ValueError(f"nsteps must be positive, got {nsteps}")
+        detail_timing: dict[str, float] = {}
         t0 = time.perf_counter()
-        for _ in range(nsteps):
-            self._stage_pending_wrenches()
-            for rigid in self.rigid_objects.values():
-                rigid.write_data_to_sim()
-            self.robot.write_data_to_sim()
-            self.sim.step(render=False)
-            self.robot.update(self.sim_dt)
-            for rigid in self.rigid_objects.values():
-                rigid.update(self.sim_dt)
+        if self._profile_detail:
+            phase_sums = {
+                "physics_wrench_stage_ms": 0.0,
+                "physics_rigid_write_ms": 0.0,
+                "physics_robot_write_ms": 0.0,
+                "physics_sim_step_ms": 0.0,
+                "physics_robot_update_ms": 0.0,
+                "physics_rigid_update_ms": 0.0,
+            }
+            for _ in range(nsteps):
+                phase_t0 = time.perf_counter()
+                self._stage_pending_wrenches()
+                phase_sums["physics_wrench_stage_ms"] += (time.perf_counter() - phase_t0) * 1000.0
+                phase_t0 = time.perf_counter()
+                for rigid in self.rigid_objects.values():
+                    rigid.write_data_to_sim()
+                phase_sums["physics_rigid_write_ms"] += (time.perf_counter() - phase_t0) * 1000.0
+                phase_t0 = time.perf_counter()
+                self.robot.write_data_to_sim()
+                phase_sums["physics_robot_write_ms"] += (time.perf_counter() - phase_t0) * 1000.0
+                phase_t0 = time.perf_counter()
+                self.sim.step(render=False)
+                phase_sums["physics_sim_step_ms"] += (time.perf_counter() - phase_t0) * 1000.0
+                phase_t0 = time.perf_counter()
+                self.robot.update(self.sim_dt)
+                phase_sums["physics_robot_update_ms"] += (time.perf_counter() - phase_t0) * 1000.0
+                phase_t0 = time.perf_counter()
+                for rigid in self.rigid_objects.values():
+                    rigid.update(self.sim_dt)
+                phase_sums["physics_rigid_update_ms"] += (time.perf_counter() - phase_t0) * 1000.0
+            detail_timing.update(phase_sums)
+        else:
+            for _ in range(nsteps):
+                self._stage_pending_wrenches()
+                for rigid in self.rigid_objects.values():
+                    rigid.write_data_to_sim()
+                self.robot.write_data_to_sim()
+                self.sim.step(render=False)
+                self.robot.update(self.sim_dt)
+                for rigid in self.rigid_objects.values():
+                    rigid.update(self.sim_dt)
         physics_ms = (time.perf_counter() - t0) * 1000.0
         t0 = time.perf_counter()
         self.refresh_state_slots()
         refresh_ms = (time.perf_counter() - t0) * 1000.0
+        if self._profile_detail:
+            detail_timing.update(self._last_refresh_timing_ms)
         for slot_name in (
             self.protocol.WRENCH_FORCE_SLOT,
             self.protocol.WRENCH_TORQUE_SLOT,
         ):
             if slot_name in self.slots:
                 self.slots[slot_name].fill(0.0)
-        return {
-            "timing": {
-                "control_upload_ms": 0.0,
-                "physics_ms": physics_ms,
-                "state_refresh_ms": refresh_ms,
-            }
+        timing = {
+            "control_upload_ms": 0.0,
+            "physics_ms": physics_ms,
+            "state_refresh_ms": refresh_ms,
         }
+        if self._profile_detail:
+            timing["worker_control_prepare_ms"] = control_prepare_ms
+            timing.update(detail_timing)
+            timing["worker_step_total_ms"] = (time.perf_counter() - worker_step_t0) * 1000.0
+        return {"timing": timing}
 
     def _stage_pending_wrenches(self) -> None:
         """Copy dense public rigid-root rows into IsaacLab wrench buffers."""
@@ -2227,6 +2323,7 @@ class _WorkerContext:
             )
 
     def set_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        set_state_t0 = time.perf_counter()
         count = int(payload["count"])
         if count < 0 or count > self.num_envs:
             raise ValueError(f"reset count must be in [0, {self.num_envs}], got {count}")
@@ -2253,7 +2350,11 @@ class _WorkerContext:
             )
         if not robot_write and not entity_names:
             raise ValueError("reset transaction writes nothing: robot=False and no entity_roots")
+        t0 = time.perf_counter()
         env_ids = self.torch.as_tensor(env_ids_np, dtype=self.torch.long, device=self.device)
+        env_id_tensor_ms = (time.perf_counter() - t0) * 1000.0
+        robot_write_ms = 0.0
+        entity_write_ms = 0.0
         if robot_write:
             qpos = np.asarray(self.slots["reset_qpos"][:count], dtype=np.float32)
             qvel = np.asarray(self.slots["reset_qvel"][:count], dtype=np.float32)
@@ -2269,6 +2370,7 @@ class _WorkerContext:
             native_vel = np.zeros_like(native_pos)
             native_pos[:, self.native_joint_for_contract] = qpos[:, 7 : 7 + self.num_dof]
             native_vel[:, self.native_joint_for_contract] = qvel[:, 6 : 6 + self.num_dof]
+            t0 = time.perf_counter()
             if not self._fixed_base:
                 root_pose_np = qpos[:, :7].copy()
                 root_pose_np[:, :3] += self.env_origins[env_ids_np]
@@ -2287,6 +2389,8 @@ class _WorkerContext:
             )
             self.robot.reset(env_ids)
             self.robot.update(self.sim_dt)
+            robot_write_ms = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
         for name in entity_names:
             # Slot layout matches the read direction: pos xyz (local frame),
             # quat wxyz, world linear velocity, world angular velocity.
@@ -2313,14 +2417,33 @@ class _WorkerContext:
             )
             rigid.reset(env_ids)
             rigid.update(self.sim_dt)
+        entity_write_ms = (time.perf_counter() - t0) * 1000.0
         t0 = time.perf_counter()
         self.refresh_state_slots(env_ids_np)
-        return {
-            "timing": {
-                "set_state_reset_upload_ms": 0.0,
-                "set_state_host_cache_refresh_ms": (time.perf_counter() - t0) * 1000.0,
-            }
+        refresh_ms = (time.perf_counter() - t0) * 1000.0
+        timing = {
+            "set_state_reset_upload_ms": 0.0,
+            "set_state_host_cache_refresh_ms": refresh_ms,
         }
+        if self._profile_detail:
+            timing.update(
+                {
+                    "set_state_reset_upload_ms": robot_write_ms + entity_write_ms,
+                    "set_state_env_id_tensor_ms": env_id_tensor_ms,
+                    "set_state_robot_write_ms": robot_write_ms,
+                    "set_state_entity_write_ms": entity_write_ms,
+                    "set_state_refresh_total_ms": refresh_ms,
+                    "set_state_worker_total_ms": (time.perf_counter() - set_state_t0) * 1000.0,
+                }
+            )
+            timing.update(
+                {
+                    f"set_state_{key}": value
+                    for key, value in self._last_refresh_timing_ms.items()
+                    if key.startswith("refresh_")
+                }
+            )
+        return {"timing": timing}
 
     def get_meta(self) -> dict[str, Any]:
         return {

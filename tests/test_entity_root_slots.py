@@ -481,3 +481,33 @@ def test_set_state_empty_rows_is_a_noop(multi_asset_backend):
     )
     assert captured == []
     assert "timing" in result
+
+
+def test_set_state_cancels_staged_wrench_rows(multi_asset_backend):
+    """A reset cancels any wrench staged for the reset rows (reaudit fix P1).
+
+    The original clears its wrench buffers inside the task reset
+    (reset_utils.py:405-406) and re-gates at the next pre-physics step, so a
+    freshly reset row never receives a pre-reset impulse.  The worker applies
+    the staged slots at the next CMD_STEP and clears them only afterwards, so
+    the host must zero the selected rows here.
+    """
+    backend = multi_asset_backend
+    _capture_request(backend)
+    rows = np.asarray([1, 3])
+    backend._slots[protocol.WRENCH_FORCE_SLOT][:] = 5.0
+    backend._slots[protocol.WRENCH_TORQUE_SLOT][:] = -5.0
+    qpos = np.full((2, 7 + NUM_DOF), 0.5, dtype=np.float32)
+    qvel = np.zeros((2, 6 + NUM_DOF), dtype=np.float32)
+    backend.set_state(rows, qpos, qvel)
+    # Reset rows carry no staged wrench...
+    np.testing.assert_array_equal(backend._slots[protocol.WRENCH_FORCE_SLOT][rows], 0.0)
+    np.testing.assert_array_equal(backend._slots[protocol.WRENCH_TORQUE_SLOT][rows], 0.0)
+    # ...untouched rows keep theirs byte-for-byte.
+    untouched = [index for index in range(NUM_ENVS) if index not in (1, 3)]
+    np.testing.assert_array_equal(
+        backend._slots[protocol.WRENCH_FORCE_SLOT][untouched], 5.0
+    )
+    np.testing.assert_array_equal(
+        backend._slots[protocol.WRENCH_TORQUE_SLOT][untouched], -5.0
+    )
