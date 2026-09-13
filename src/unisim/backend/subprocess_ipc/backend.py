@@ -1424,14 +1424,26 @@ class MjcfSubprocessBackend(SimBackend):
         if ctrl_array.shape != expected:
             raise ValueError(f"ctrl must have shape {expected}, got {ctrl_array.shape}")
 
+        profile_detail = os.environ.get("UNISIM_PROFILE_DETAIL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         t0 = time.perf_counter()
         np.copyto(self._slots["ctrl"], ctrl_array)
+        control_slot_copy_ms = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
         payload = self._request(
             protocol.CMD_STEP, {"nsteps": int(nsteps)}, expect=protocol.CMD_READY
         )
-        ipc_ms = (time.perf_counter() - t0) * 1000.0
+        worker_request_ms = (time.perf_counter() - t0) * 1000.0
+        ipc_ms = control_slot_copy_ms + worker_request_ms
         timing = dict(payload.get("timing", {})) if isinstance(payload, dict) else {}
         timing["worker_ipc_total_ms"] = ipc_ms
+        if profile_detail:
+            timing["host_control_slot_copy_ms"] = control_slot_copy_ms
+            timing["host_worker_request_ms"] = worker_request_ms
         return {"timing": timing}
 
     def set_state(
@@ -1520,24 +1532,53 @@ class MjcfSubprocessBackend(SimBackend):
         if rows.size == 0:
             return {"timing": timing}
 
-        t0 = time.perf_counter()
+        profile_detail = os.environ.get("UNISIM_PROFILE_DETAIL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        upload_t0 = time.perf_counter()
         count = int(rows.size)
+        # A reset cancels any wrench staged for the selected rows by an
+        # interval event earlier in the same control step (reaudit fix P1).
+        # The original clears its wrench buffers inside the task reset
+        # (reset_utils.py:405-406), so a freshly reset row must not receive a
+        # pre-reset impulse; the worker applies these slots at the next
+        # CMD_STEP and only clears them afterwards.  Legacy single-asset
+        # scenes have no wrench slots.
+        for slot_name in (protocol.WRENCH_FORCE_SLOT, protocol.WRENCH_TORQUE_SLOT):
+            slot = self._slots.get(slot_name)
+            if slot is not None:
+                slot[rows] = 0.0
+        t0 = time.perf_counter()
         np.copyto(self._slots["reset_env_ids"][:count], rows.astype(np.int32))
+        reset_ids_copy_ms = (time.perf_counter() - t0) * 1000.0
         # Legacy scenes (no rigid entities, robot state always written) send
         # exactly {"count": count}; the extra keys exist only for multi-asset
         # scenes so older mujoco-family workers never see them.
         payload: dict[str, Any] = {"count": count}
         if robot_write:
             assert qpos_array is not None and qvel_array is not None
+            t0 = time.perf_counter()
             np.copyto(self._slots["reset_qpos"][:count], qpos_array)
             np.copyto(self._slots["reset_qvel"][:count], qvel_array)
+            reset_robot_copy_ms = (time.perf_counter() - t0) * 1000.0
+        else:
+            reset_robot_copy_ms = 0.0
+        reset_entity_copy_ms = 0.0
+        t0 = time.perf_counter()
         for name, array in entity_states.items():
             np.copyto(self._slots[protocol.entity_reset_state_slot(name)][:count], array)
+        reset_entity_copy_ms = (time.perf_counter() - t0) * 1000.0
         if self._rigid_root_entities:
             payload["robot"] = robot_write
             payload["entity_roots"] = sorted(entity_states)
+        host_upload_ms = (time.perf_counter() - upload_t0) * 1000.0
+        request_t0 = time.perf_counter()
         payload = self._request(protocol.CMD_SET_STATE, payload, expect=protocol.CMD_READY)
-        ipc_ms = (time.perf_counter() - t0) * 1000.0
+        request_ms = (time.perf_counter() - request_t0) * 1000.0
+        ipc_ms = host_upload_ms + request_ms
         if isinstance(payload, dict):
             worker_timing = payload.get("timing", {})
             timing["set_state_reset_upload_ms"] = float(
@@ -1549,6 +1590,12 @@ class MjcfSubprocessBackend(SimBackend):
         timing["set_state_internal_gap_ms"] = (
             ipc_ms - timing["set_state_reset_upload_ms"] - timing["set_state_host_cache_refresh_ms"]
         )
+        if profile_detail:
+            timing["set_state_host_env_ids_copy_ms"] = reset_ids_copy_ms
+            timing["set_state_host_robot_copy_ms"] = reset_robot_copy_ms
+            timing["set_state_host_entity_copy_ms"] = reset_entity_copy_ms
+            timing["set_state_host_upload_total_ms"] = host_upload_ms
+            timing["set_state_host_worker_request_ms"] = request_ms
         return {"timing": timing}
 
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
