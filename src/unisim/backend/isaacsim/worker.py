@@ -85,21 +85,34 @@ def _resolve_articulation_root_prim_path(usd_path: str, root_name: str) -> str:
         raise RuntimeError(f"IsaacSim converted USD asset {usd_path!r} has no valid default prim")
     asset_path = str(default_prim.GetPath()).rstrip("/")
     candidates = []
+    articulation_roots = []
     for prim in stage.Traverse():
         path = str(prim.GetPath())
         if not path.startswith(asset_path + "/"):
             continue
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            articulation_roots.append(path)
         if path.rsplit("/", 1)[-1] != root_name:
             continue
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             candidates.append(path)
-    if len(candidates) != 1:
+    # IsaacSim's URDF converter creates a native ``root_joint`` articulation
+    # root when ``fix_base=True``.  That root is the fixed-base articulation
+    # contract; it is not the named link prim.  Prefer the explicitly named
+    # root only when it is the sole authored root, otherwise accept the sole
+    # converter root as the authoritative path.
+    if len(candidates) == 1:
+        selected = candidates[0]
+    elif not candidates and len(articulation_roots) == 1:
+        selected = articulation_roots[0]
+    else:
         raise RuntimeError(
             "IsaacSim converted USD articulation root lookup for body "
             f"{root_name!r} expected one ArticulationRootAPI prim below "
-            f"{asset_path!r}, found {candidates or '<none>'}"
+            f"{asset_path!r}, found named={candidates or '<none>'}, "
+            f"all={articulation_roots or '<none>'}"
         )
-    relative = candidates[0][len(asset_path) :]
+    relative = selected[len(asset_path) :]
     if not relative.startswith("/"):
         raise RuntimeError(
             f"IsaacSim articulation root {candidates[0]!r} is not below {asset_path!r}"
@@ -134,6 +147,21 @@ def _patch_urdf_articulation_root(usd_path: str, root_name: str) -> None:
             f"isaacsim URDF articulation root patch expected exactly one prim "
             f"named {root_name!r} below {default_path!r}, found "
             f"{[str(prim.GetPath()) for prim in matches] or '<none>'}"
+        )
+    existing_roots = [
+        prim for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+    ]
+    if len(existing_roots) == 1:
+        # The URDF converter already authored the correct root (normally
+        # ``root_joint`` for a fixed-base import).  Applying another root API
+        # to the link would create two articulation roots and makes PhysX
+        # report the robot as floating even though ``fix_base=True`` was used.
+        stage.GetRootLayer().Save()
+        return
+    if existing_roots:
+        raise RuntimeError(
+            "isaacsim URDF articulation root patch found multiple existing roots: "
+            f"{[str(prim.GetPath()) for prim in existing_roots]}"
         )
     UsdPhysics.ArticulationRootAPI.Apply(matches[0])
     stage.GetRootLayer().Save()
@@ -938,6 +966,9 @@ class _WorkerContext:
         # randomization variant pool was materialized; used for the INIT
         # round-robin forensics report.
         self._variant_pool_usds: tuple[str, list[str]] | None = None
+        # (entity_name, source_pool_target, usd_paths) when a kinematic entity
+        # mirrors a declared variant pool (SimToolReal goalviz, 2026-09-14).
+        self._goalviz_mirror: tuple[str, str, list[str]] | None = None
         self.simulation_app: Any = None
         self.torch: Any = None
         self.render_mode = "none"
@@ -1219,12 +1250,14 @@ class _WorkerContext:
         else:
             sim_cfg = sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
         self.sim = sim_utils.SimulationContext(sim_cfg)
-        if render_mode != "none":
-            # Use IsaacSim's standard grid-world floor for rendered playback.
-            # The MJCF floor is retained for the task/physics contract, while
-            # this native floor supplies the normal IsaacSim visual ground.
-            ground_cfg = sim_utils.GroundPlaneCfg()
-            ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
+        # Ground plane: the original scene spawns a colliding /World/ground in
+        # training and playback alike (scene_utils.py:1807, spawn_ground_plane
+        # + GroundPlaneCfg defaults).  The default cfg's visual grid USD is a
+        # Nucleus asset and breaks offline cold starts, so author the same
+        # physics locally — collision plane plus the default rigid-body
+        # material (0.5/0.5/0.0) — and a neutral local visual quad
+        # (training-pipeline-reaudit F7 re-closure).
+        self._spawn_local_ground_plane()
         # IsaacLab's SimulationContext owns the singleton simulation stage and
         # must be materialized before assets/articulations bind to it.  Keep
         # this ordering explicit so a real Kit worker does not accidentally
@@ -1318,6 +1351,11 @@ class _WorkerContext:
         meta: dict[str, Any] = {
             "num_dof": self.num_dof,
             "num_bodies": self.num_bodies,
+            # Runtime fixity diagnostics (training-pipeline-reaudit): the
+            # payload flag vs IsaacLab's own view of the articulation root.
+            "fixed_base": bool(self._fixed_base),
+            "robot_is_fixed_base": bool(getattr(self.robot, "is_fixed_base", False)),
+            "robot_articulation_root": articulation_root,
             # Expose UniLab contract order, not the importer/native order.
             "dof_names": list(self.contract_joint_names),
             "body_names": list(self.contract_body_names),
@@ -1336,6 +1374,37 @@ class _WorkerContext:
             "env_origins": self.env_origins.tolist(),
             "collision_filtering_applied": self.collision_filtering_applied,
         }
+        if entity_payloads:
+            # Articulation-root forensics (reaudit): which prim carries the
+            # root API and how the root link is anchored.  A fixed-base
+            # conversion anchors the root link to the world through a fixed
+            # ``root_joint``; a second root API on the named link would make
+            # PhysX report the robot as floating.
+            from pxr import Usd, UsdPhysics  # type: ignore[import-not-found]
+
+            usd_stage = Usd.Stage.Open(robot_usd_path)
+            root_api_prims = [
+                str(prim.GetPath())
+                for prim in usd_stage.Traverse()
+                if prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+            ]
+            anchors = []
+            for joint in usd_stage.Traverse():
+                if not joint.IsA(UsdPhysics.FixedJoint):
+                    continue
+                j = UsdPhysics.FixedJoint(joint)
+                anchors.append(
+                    {
+                        "path": str(joint.GetPath()),
+                        "body0": str(j.GetBody0Rel().GetTargets() or ["<world>"])[1:-1].strip("'"),
+                        "body1": str(j.GetBody1Rel().GetTargets() or ["<world>"])[1:-1].strip("'"),
+                    }
+                )
+            meta["articulation_forensics"] = {
+                "articulation_root_prims": root_api_prims,
+                "fixed_joints": anchors,
+                "default_prim": str(usd_stage.GetDefaultPrim().GetPath()),
+            }
         if entity_payloads:
             # Multi-asset forensics for the host/probe: per-entity prim
             # presence, ImplicitActuator gain readback (env 0, contract joint
@@ -1369,6 +1438,13 @@ class _WorkerContext:
                     meta["variant_assignment"]["masses"] = [
                         float(value) for value in variant_pool["masses"]
                     ]
+            if self._goalviz_mirror is not None:
+                mirror_name, mirror_source, mirror_usds = self._goalviz_mirror
+                meta["goalviz_mirror"] = {
+                    "source_pool_target": mirror_source,
+                    "variants": len(mirror_usds),
+                    "observed": self._observe_variant_assignment(mirror_name, mirror_usds),
+                }
         return meta
 
     def _readback_scene_physx(self) -> dict[str, Any]:
@@ -1411,6 +1487,57 @@ class _WorkerContext:
         solver_value = solver_attr.Get() if solver_attr is not None else None
         readback["solver_type"] = "default_tgs" if solver_value is None else solver_value
         return readback
+
+    def _spawn_local_ground_plane(self, prim_path: str = "/World/ground") -> None:
+        """Author the original scene's colliding ground without Nucleus.
+
+        ``spawn_ground_plane`` + ``GroundPlaneCfg`` (scene_utils.py:1807)
+        creates ``/World/ground`` with a collision plane bound to the default
+        rigid-body material, but its default visual grid USD is a Nucleus
+        asset that breaks offline cold starts, and this Kit build's UsdPhysics
+        exposes neither ``PlaneAPI`` nor a writable ``UsdGeomPlane`` normal.
+        This authors the ground as a large thin collision box whose top
+        surface is z=0, bound to the Isaac Lab default rigid-body material
+        (static/dynamic friction 0.5, restitution 0.0) — functionally
+        equivalent for this task, whose falling objects terminate at
+        z < 0.1 long before a bounded extent could matter.  Spawned in
+        training (headless) and playback alike, matching the original scene
+        contract; the box's own display color provides the visual floor.
+        """
+        from isaaclab.sim.spawners.materials import (
+            RigidBodyMaterialCfg,  # type: ignore[import-not-found]
+        )
+        from isaaclab.sim.utils import bind_physics_material  # type: ignore[import-not-found]
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics  # type: ignore[import-not-found]
+
+        stage = self.sim.stage
+        if stage.GetPrimAtPath(prim_path).IsValid():
+            raise ValueError(f"A prim already exists at path: '{prim_path}'.")
+
+        # Flat ground collider as a large thin box whose top surface is z=0.
+        # The original uses an infinite UsdPhysics plane; this Kit build's
+        # UsdPhysics exposes neither PlaneAPI nor a writable UsdGeomPlane
+        # normal, and a bounded box is functionally equivalent here — falling
+        # objects rest on the same z=0 surface long before reaching the
+        # ±100 m extent (fall terminates at object z < 0.1).
+        half = 100.0
+        thickness = 0.1
+        box = UsdGeom.Cube.Define(stage, Sdf.Path(prim_path))
+        box.CreateSizeAttr(1.0)
+        box_prim = box.GetPrim()
+        xform = UsdGeom.XformCommonAPI(box_prim)
+        xform.SetTranslate(Gf.Vec3d(0.0, 0.0, -thickness / 2.0))
+        xform.SetScale(Gf.Vec3f(half * 2.0, half * 2.0, thickness))
+        box.CreateDisplayColorAttr([Gf.Vec3f(0.32, 0.34, 0.36)])
+        UsdPhysics.CollisionAPI.Apply(box_prim)
+
+        # Isaac Lab's default rigid-body material: the same 0.5/0.5/0.0
+        # triple GroundPlaneCfg binds to the original ground (from_files_cfg
+        # RigidBodyMaterialCfg defaults; scene_utils.py:1807 uses cfg defaults).
+        material_cfg = RigidBodyMaterialCfg()
+        material_path = f"{prim_path}/physicsMaterial"
+        material_cfg.func(material_path, material_cfg)
+        bind_physics_material(prim_path, material_path)
 
     def _physics_scene_path(self) -> str:
         """Find the stage's PhysX scene prim on the materialization path."""
@@ -1724,26 +1851,68 @@ class _WorkerContext:
                 # all physics is authored by the bake above.
                 spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
             elif root_mode == "kinematic":
-                # Goalviz converts object-style (the original bakes from the
-                # object USDs, scene_utils.py:1714-1719); the table converts
-                # with the default flag, capsules=False (scene_utils.py:1752).
-                # The bake authors kinematic/gravity and, for the goalviz
-                # only, collisionEnabled=False.
-                usd_path = self._convert_entity_urdf(
-                    os.fspath(entry["model_file"]),
-                    fix_base=False,
-                    self_collision=None,
-                    with_joint_drive=False,
-                    replace_cylinders_with_capsules=(name == "goalviz"),
+                # Goalviz converts object-style: the original bakes the goalviz
+                # copies from the SAME per-tool USD batch as the dynamic object
+                # (scene_utils.py:1714-1719), so every env's goalviz shows that
+                # env's tool shape.  When a variant pool targets the dynamic
+                # object, mirror the pool batch here with the goalviz role
+                # bake (kinematic, gravity off, collisionEnabled=False); the
+                # table keeps its single declared file (capsules=False,
+                # scene_utils.py:1752), and without a pool the goalviz keeps
+                # its own declared file too.
+                mirror_pool = (
+                    pool is not None and name == "goalviz" and pool["target_entity"] != name
                 )
-                _bake_usd_in_place(
-                    usd_path,
-                    bake_plan_for_entity(
-                        materialization, root_mode, role=name, is_variant_target=False
-                    ),
-                )
-                entry["_usd_path"] = usd_path
-                spawn = UsdFileCfg(usd_path=usd_path)
+                if mirror_pool:
+                    pool_usds = [
+                        self._convert_entity_urdf(
+                            source,
+                            fix_base=False,
+                            self_collision=None,
+                            with_joint_drive=False,
+                            replace_cylinders_with_capsules=True,
+                        )
+                        for source in pool["source_files"]
+                    ]
+                    for pool_usd in pool_usds:
+                        _bake_usd_in_place(
+                            pool_usd,
+                            bake_plan_for_entity(
+                                materialization, root_mode, role=name, is_variant_target=False
+                            ),
+                        )
+                    assignments = pool["assignments"]
+                    round_robin = assignments == [
+                        index % len(pool_usds) for index in range(self.num_envs)
+                    ]
+                    spawn_usds = (
+                        pool_usds
+                        if round_robin
+                        else [pool_usds[assignments[index]] for index in range(self.num_envs)]
+                    )
+                    entry["_usd_path"] = spawn_usds
+                    self._goalviz_mirror = (name, str(pool["target_entity"]), pool_usds)
+                    spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
+                else:
+                    # The table converts with the default flag, capsules=False
+                    # (scene_utils.py:1752).  The bake authors
+                    # kinematic/gravity and, for the goalviz only,
+                    # collisionEnabled=False.
+                    usd_path = self._convert_entity_urdf(
+                        os.fspath(entry["model_file"]),
+                        fix_base=False,
+                        self_collision=None,
+                        with_joint_drive=False,
+                        replace_cylinders_with_capsules=(name == "goalviz"),
+                    )
+                    _bake_usd_in_place(
+                        usd_path,
+                        bake_plan_for_entity(
+                            materialization, root_mode, role=name, is_variant_target=False
+                        ),
+                    )
+                    entry["_usd_path"] = usd_path
+                    spawn = UsdFileCfg(usd_path=usd_path)
             else:
                 # Floating rigid (object role): author dynamic rigid-body
                 # physics. Table and goalviz use the explicit kinematic mode.
@@ -1864,6 +2033,45 @@ class _WorkerContext:
                     f"IsaacLab actuator does not expose {name!r}; cannot read back gains"
                 )
             report[name] = [float(value) for value in env0(values)[self.native_joint_for_contract]]
+        # Diagnostic (2026-09-14 lift-latch investigation): also read the LIVE
+        # PhysX drive values back so probes can distinguish "cfg tensors look
+        # right" from "implicit gains actually landed in the sim".  Pure
+        # readback; no behavior change.
+        view = getattr(self.robot, "root_physx_view", None)
+        if view is not None and hasattr(view, "get_dof_stiffnesses"):
+
+            def _live(getter: str) -> np.ndarray | None:
+                if not hasattr(view, getter):
+                    return None
+                array = _tensor_numpy(getattr(view, getter)())
+                if array.ndim == 2:
+                    array = array[0]
+                return array
+
+            live_stiffness = _live("get_dof_stiffnesses")
+            live_damping = _live("get_dof_dampings")
+            if live_stiffness is not None:
+                report["physx_stiffness_env0_native"] = [float(value) for value in live_stiffness]
+                report["physx_stiffness_env0"] = [
+                    float(value) for value in live_stiffness[self.native_joint_for_contract]
+                ]
+            if live_damping is not None:
+                report["physx_damping_env0_native"] = [float(value) for value in live_damping]
+                report["physx_damping_env0"] = [
+                    float(value) for value in live_damping[self.native_joint_for_contract]
+                ]
+            # Position targets are write-only in this PhysX tensor API; fall
+            # back to IsaacLab's own commanded-target buffer (what the
+            # articulation last pushed to the sim).
+            try:
+                live_targets = _tensor_numpy(self.robot.data.joint_pos_target)
+                if live_targets.ndim == 2:
+                    live_targets = live_targets[0]
+                report["physx_targets_env0"] = [
+                    float(value) for value in live_targets[self.native_joint_for_contract]
+                ]
+            except (AttributeError, NotImplementedError):
+                pass
         return report
 
     def _apply_friction_writes(self, entity_payloads: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1948,6 +2156,7 @@ class _WorkerContext:
         FilteredPairs are checked against the URDF-derived adjacency.
         """
         pool_target = None if self._variant_pool_usds is None else self._variant_pool_usds[0]
+        mirror_target = None if self._goalviz_mirror is None else self._goalviz_mirror[0]
         report: dict[str, Any] = {}
         for entry in entity_payloads:
             name = str(entry["name"])
@@ -1968,6 +2177,8 @@ class _WorkerContext:
             )
             if is_pool_target:
                 usd_paths = sorted(set(self._variant_pool_usds[1]))
+            elif name == mirror_target:
+                usd_paths = sorted(set(self._goalviz_mirror[2]))
             else:
                 usd_paths = [str(entry.get("_usd_path") or "")]
             variants = [{"usd_path": path, **_verify_baked_usd(path, plan)} for path in usd_paths]
@@ -2459,6 +2670,11 @@ class _WorkerContext:
             "render_height": self.render_height,
             "env_origins": self.env_origins.tolist(),
             "collision_filtering_applied": self.collision_filtering_applied,
+            # Runtime fixity diagnostics (training-pipeline-reaudit): the
+            # payload flag vs IsaacLab's own view of the articulation root.
+            # These must agree and be True for SimToolReal's fixed-base robot.
+            "fixed_base": bool(self._fixed_base),
+            "robot_is_fixed_base": bool(getattr(self.robot, "is_fixed_base", False)),
         }
 
     # ------------------------------------------------------------------
