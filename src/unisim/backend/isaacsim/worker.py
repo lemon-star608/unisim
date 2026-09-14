@@ -1981,6 +1981,47 @@ class _WorkerContext:
                     f"IsaacLab actuator does not expose {name!r}; cannot read back gains"
                 )
             report[name] = [float(value) for value in env0(values)[self.native_joint_for_contract]]
+        # Diagnostic (2026-09-14 lift-latch investigation): also read the LIVE
+        # PhysX drive values back so probes can distinguish "cfg tensors look
+        # right" from "implicit gains actually landed in the sim".  Pure
+        # readback; no behavior change.
+        view = getattr(self.robot, "root_physx_view", None)
+        if view is not None and hasattr(view, "get_dof_stiffnesses"):
+
+            def _live(getter: str) -> np.ndarray | None:
+                if not hasattr(view, getter):
+                    return None
+                array = _tensor_numpy(getattr(view, getter)())
+                if array.ndim == 2:
+                    array = array[0]
+                return array
+
+            live_stiffness = _live("get_dof_stiffnesses")
+            live_damping = _live("get_dof_dampings")
+            if live_stiffness is not None:
+                report["physx_stiffness_env0_native"] = [
+                    float(value) for value in live_stiffness
+                ]
+                report["physx_stiffness_env0"] = [
+                    float(value) for value in live_stiffness[self.native_joint_for_contract]
+                ]
+            if live_damping is not None:
+                report["physx_damping_env0_native"] = [float(value) for value in live_damping]
+                report["physx_damping_env0"] = [
+                    float(value) for value in live_damping[self.native_joint_for_contract]
+                ]
+            # Position targets are write-only in this PhysX tensor API; fall
+            # back to IsaacLab's own commanded-target buffer (what the
+            # articulation last pushed to the sim).
+            try:
+                live_targets = _tensor_numpy(self.robot.data.joint_pos_target)
+                if live_targets.ndim == 2:
+                    live_targets = live_targets[0]
+                report["physx_targets_env0"] = [
+                    float(value) for value in live_targets[self.native_joint_for_contract]
+                ]
+            except (AttributeError, NotImplementedError):
+                pass
         return report
 
     def _apply_friction_writes(self, entity_payloads: list[dict[str, Any]]) -> dict[str, Any]:
