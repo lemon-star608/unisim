@@ -966,6 +966,9 @@ class _WorkerContext:
         # randomization variant pool was materialized; used for the INIT
         # round-robin forensics report.
         self._variant_pool_usds: tuple[str, list[str]] | None = None
+        # (entity_name, source_pool_target, usd_paths) when a kinematic entity
+        # mirrors a declared variant pool (SimToolReal goalviz, 2026-09-14).
+        self._goalviz_mirror: tuple[str, str, list[str]] | None = None
         self.simulation_app: Any = None
         self.torch: Any = None
         self.render_mode = "none"
@@ -1435,6 +1438,13 @@ class _WorkerContext:
                     meta["variant_assignment"]["masses"] = [
                         float(value) for value in variant_pool["masses"]
                     ]
+            if self._goalviz_mirror is not None:
+                mirror_name, mirror_source, mirror_usds = self._goalviz_mirror
+                meta["goalviz_mirror"] = {
+                    "source_pool_target": mirror_source,
+                    "variants": len(mirror_usds),
+                    "observed": self._observe_variant_assignment(mirror_name, mirror_usds),
+                }
         return meta
 
     def _readback_scene_physx(self) -> dict[str, Any]:
@@ -1841,26 +1851,68 @@ class _WorkerContext:
                 # all physics is authored by the bake above.
                 spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
             elif root_mode == "kinematic":
-                # Goalviz converts object-style (the original bakes from the
-                # object USDs, scene_utils.py:1714-1719); the table converts
-                # with the default flag, capsules=False (scene_utils.py:1752).
-                # The bake authors kinematic/gravity and, for the goalviz
-                # only, collisionEnabled=False.
-                usd_path = self._convert_entity_urdf(
-                    os.fspath(entry["model_file"]),
-                    fix_base=False,
-                    self_collision=None,
-                    with_joint_drive=False,
-                    replace_cylinders_with_capsules=(name == "goalviz"),
+                # Goalviz converts object-style: the original bakes the goalviz
+                # copies from the SAME per-tool USD batch as the dynamic object
+                # (scene_utils.py:1714-1719), so every env's goalviz shows that
+                # env's tool shape.  When a variant pool targets the dynamic
+                # object, mirror the pool batch here with the goalviz role
+                # bake (kinematic, gravity off, collisionEnabled=False); the
+                # table keeps its single declared file (capsules=False,
+                # scene_utils.py:1752), and without a pool the goalviz keeps
+                # its own declared file too.
+                mirror_pool = (
+                    pool is not None and name == "goalviz" and pool["target_entity"] != name
                 )
-                _bake_usd_in_place(
-                    usd_path,
-                    bake_plan_for_entity(
-                        materialization, root_mode, role=name, is_variant_target=False
-                    ),
-                )
-                entry["_usd_path"] = usd_path
-                spawn = UsdFileCfg(usd_path=usd_path)
+                if mirror_pool:
+                    pool_usds = [
+                        self._convert_entity_urdf(
+                            source,
+                            fix_base=False,
+                            self_collision=None,
+                            with_joint_drive=False,
+                            replace_cylinders_with_capsules=True,
+                        )
+                        for source in pool["source_files"]
+                    ]
+                    for pool_usd in pool_usds:
+                        _bake_usd_in_place(
+                            pool_usd,
+                            bake_plan_for_entity(
+                                materialization, root_mode, role=name, is_variant_target=False
+                            ),
+                        )
+                    assignments = pool["assignments"]
+                    round_robin = assignments == [
+                        index % len(pool_usds) for index in range(self.num_envs)
+                    ]
+                    spawn_usds = (
+                        pool_usds
+                        if round_robin
+                        else [pool_usds[assignments[index]] for index in range(self.num_envs)]
+                    )
+                    entry["_usd_path"] = spawn_usds
+                    self._goalviz_mirror = (name, str(pool["target_entity"]), pool_usds)
+                    spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
+                else:
+                    # The table converts with the default flag, capsules=False
+                    # (scene_utils.py:1752).  The bake authors
+                    # kinematic/gravity and, for the goalviz only,
+                    # collisionEnabled=False.
+                    usd_path = self._convert_entity_urdf(
+                        os.fspath(entry["model_file"]),
+                        fix_base=False,
+                        self_collision=None,
+                        with_joint_drive=False,
+                        replace_cylinders_with_capsules=(name == "goalviz"),
+                    )
+                    _bake_usd_in_place(
+                        usd_path,
+                        bake_plan_for_entity(
+                            materialization, root_mode, role=name, is_variant_target=False
+                        ),
+                    )
+                    entry["_usd_path"] = usd_path
+                    spawn = UsdFileCfg(usd_path=usd_path)
             else:
                 # Floating rigid (object role): author dynamic rigid-body
                 # physics. Table and goalviz use the explicit kinematic mode.
@@ -1999,9 +2051,7 @@ class _WorkerContext:
             live_stiffness = _live("get_dof_stiffnesses")
             live_damping = _live("get_dof_dampings")
             if live_stiffness is not None:
-                report["physx_stiffness_env0_native"] = [
-                    float(value) for value in live_stiffness
-                ]
+                report["physx_stiffness_env0_native"] = [float(value) for value in live_stiffness]
                 report["physx_stiffness_env0"] = [
                     float(value) for value in live_stiffness[self.native_joint_for_contract]
                 ]
@@ -2106,6 +2156,7 @@ class _WorkerContext:
         FilteredPairs are checked against the URDF-derived adjacency.
         """
         pool_target = None if self._variant_pool_usds is None else self._variant_pool_usds[0]
+        mirror_target = None if self._goalviz_mirror is None else self._goalviz_mirror[0]
         report: dict[str, Any] = {}
         for entry in entity_payloads:
             name = str(entry["name"])
@@ -2126,6 +2177,8 @@ class _WorkerContext:
             )
             if is_pool_target:
                 usd_paths = sorted(set(self._variant_pool_usds[1]))
+            elif name == mirror_target:
+                usd_paths = sorted(set(self._goalviz_mirror[2]))
             else:
                 usd_paths = [str(entry.get("_usd_path") or "")]
             variants = [{"usd_path": path, **_verify_baked_usd(path, plan)} for path in usd_paths]
