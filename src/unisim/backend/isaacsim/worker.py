@@ -85,21 +85,34 @@ def _resolve_articulation_root_prim_path(usd_path: str, root_name: str) -> str:
         raise RuntimeError(f"IsaacSim converted USD asset {usd_path!r} has no valid default prim")
     asset_path = str(default_prim.GetPath()).rstrip("/")
     candidates = []
+    articulation_roots = []
     for prim in stage.Traverse():
         path = str(prim.GetPath())
         if not path.startswith(asset_path + "/"):
             continue
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            articulation_roots.append(path)
         if path.rsplit("/", 1)[-1] != root_name:
             continue
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             candidates.append(path)
-    if len(candidates) != 1:
+    # IsaacSim's URDF converter creates a native ``root_joint`` articulation
+    # root when ``fix_base=True``.  That root is the fixed-base articulation
+    # contract; it is not the named link prim.  Prefer the explicitly named
+    # root only when it is the sole authored root, otherwise accept the sole
+    # converter root as the authoritative path.
+    if len(candidates) == 1:
+        selected = candidates[0]
+    elif not candidates and len(articulation_roots) == 1:
+        selected = articulation_roots[0]
+    else:
         raise RuntimeError(
             "IsaacSim converted USD articulation root lookup for body "
             f"{root_name!r} expected one ArticulationRootAPI prim below "
-            f"{asset_path!r}, found {candidates or '<none>'}"
+            f"{asset_path!r}, found named={candidates or '<none>'}, "
+            f"all={articulation_roots or '<none>'}"
         )
-    relative = candidates[0][len(asset_path) :]
+    relative = selected[len(asset_path) :]
     if not relative.startswith("/"):
         raise RuntimeError(
             f"IsaacSim articulation root {candidates[0]!r} is not below {asset_path!r}"
@@ -134,6 +147,21 @@ def _patch_urdf_articulation_root(usd_path: str, root_name: str) -> None:
             f"isaacsim URDF articulation root patch expected exactly one prim "
             f"named {root_name!r} below {default_path!r}, found "
             f"{[str(prim.GetPath()) for prim in matches] or '<none>'}"
+        )
+    existing_roots = [
+        prim for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+    ]
+    if len(existing_roots) == 1:
+        # The URDF converter already authored the correct root (normally
+        # ``root_joint`` for a fixed-base import).  Applying another root API
+        # to the link would create two articulation roots and makes PhysX
+        # report the robot as floating even though ``fix_base=True`` was used.
+        stage.GetRootLayer().Save()
+        return
+    if existing_roots:
+        raise RuntimeError(
+            "isaacsim URDF articulation root patch found multiple existing roots: "
+            f"{[str(prim.GetPath()) for prim in existing_roots]}"
         )
     UsdPhysics.ArticulationRootAPI.Apply(matches[0])
     stage.GetRootLayer().Save()
@@ -1219,12 +1247,14 @@ class _WorkerContext:
         else:
             sim_cfg = sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
         self.sim = sim_utils.SimulationContext(sim_cfg)
-        if render_mode != "none":
-            # Use IsaacSim's standard grid-world floor for rendered playback.
-            # The MJCF floor is retained for the task/physics contract, while
-            # this native floor supplies the normal IsaacSim visual ground.
-            ground_cfg = sim_utils.GroundPlaneCfg()
-            ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
+        # Ground plane: the original scene spawns a colliding /World/ground in
+        # training and playback alike (scene_utils.py:1807, spawn_ground_plane
+        # + GroundPlaneCfg defaults).  The default cfg's visual grid USD is a
+        # Nucleus asset and breaks offline cold starts, so author the same
+        # physics locally — collision plane plus the default rigid-body
+        # material (0.5/0.5/0.0) — and a neutral local visual quad
+        # (training-pipeline-reaudit F7 re-closure).
+        self._spawn_local_ground_plane()
         # IsaacLab's SimulationContext owns the singleton simulation stage and
         # must be materialized before assets/articulations bind to it.  Keep
         # this ordering explicit so a real Kit worker does not accidentally
@@ -1411,6 +1441,62 @@ class _WorkerContext:
         solver_value = solver_attr.Get() if solver_attr is not None else None
         readback["solver_type"] = "default_tgs" if solver_value is None else solver_value
         return readback
+
+    def _spawn_local_ground_plane(self, prim_path: str = "/World/ground") -> None:
+        """Author the original scene's colliding ground plane without Nucleus.
+
+        ``spawn_ground_plane`` + ``GroundPlaneCfg`` (scene_utils.py:1807)
+        creates ``/World/ground`` with a collision plane and the default
+        rigid-body material, but its default visual grid USD is a Nucleus
+        asset that breaks offline cold starts.  This authors the same physics
+        locally — an upward ``UsdGeomPlane`` with ``CollisionAPI``/``PlaneAPI``
+        and the Isaac Lab default rigid-body material (static/dynamic friction
+        0.5, restitution 0.0) — plus a flat neutral visual quad so rendered
+        playback has a grounded reference.  Spawned in training (headless) and
+        playback alike, matching the original scene contract.
+        """
+        from isaaclab.sim.spawners.materials import (
+            RigidBodyMaterialCfg,  # type: ignore[import-not-found]
+        )
+        from isaaclab.sim.utils import bind_physics_material  # type: ignore[import-not-found]
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics  # type: ignore[import-not-found]
+
+        stage = self.sim.stage
+        if stage.GetPrimAtPath(prim_path).IsValid():
+            raise ValueError(f"A prim already exists at path: '{prim_path}'.")
+
+        # Infinite upward collision plane (PhysX treats it as unbounded).
+        plane = UsdGeom.Plane.Define(stage, Sdf.Path(prim_path))
+        plane.CreateWidthAttr(2.0)
+        plane.CreateLengthAttr(2.0)
+        plane_prim = plane.GetPrim()
+        UsdPhysics.CollisionAPI.Apply(plane_prim)
+        UsdPhysics.PlaneAPI.Apply(plane_prim)
+
+        # Isaac Lab's default rigid-body material: the same 0.5/0.5/0.0
+        # triple GroundPlaneCfg binds to the original ground (from_files_cfg
+        # RigidBodyMaterialCfg defaults; scene_utils.py:1807 uses cfg defaults).
+        material_cfg = RigidBodyMaterialCfg()
+        material_path = f"{prim_path}/physicsMaterial"
+        material_cfg.func(material_path, material_cfg)
+        bind_physics_material(prim_path, material_path)
+
+        # Flat visual quad so rendered playback shows a grounded floor without
+        # any external asset.  Neutral gray; the dome light shades it.
+        visual_path = f"{prim_path}/visual"
+        mesh = UsdGeom.Mesh.Define(stage, Sdf.Path(visual_path))
+        half = 50.0
+        mesh.CreatePointsAttr(
+            [
+                Gf.Vec3f(-half, -half, 0.0),
+                Gf.Vec3f(half, -half, 0.0),
+                Gf.Vec3f(half, half, 0.0),
+                Gf.Vec3f(-half, half, 0.0),
+            ]
+        )
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        mesh.CreateDisplayColorAttr([Gf.Vec3f(0.32, 0.34, 0.36)])
 
     def _physics_scene_path(self) -> str:
         """Find the stage's PhysX scene prim on the materialization path."""
