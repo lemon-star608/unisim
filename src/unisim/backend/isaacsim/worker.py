@@ -1348,6 +1348,11 @@ class _WorkerContext:
         meta: dict[str, Any] = {
             "num_dof": self.num_dof,
             "num_bodies": self.num_bodies,
+            # Runtime fixity diagnostics (training-pipeline-reaudit): the
+            # payload flag vs IsaacLab's own view of the articulation root.
+            "fixed_base": bool(self._fixed_base),
+            "robot_is_fixed_base": bool(getattr(self.robot, "is_fixed_base", False)),
+            "robot_articulation_root": articulation_root,
             # Expose UniLab contract order, not the importer/native order.
             "dof_names": list(self.contract_joint_names),
             "body_names": list(self.contract_body_names),
@@ -1366,6 +1371,37 @@ class _WorkerContext:
             "env_origins": self.env_origins.tolist(),
             "collision_filtering_applied": self.collision_filtering_applied,
         }
+        if entity_payloads:
+            # Articulation-root forensics (reaudit): which prim carries the
+            # root API and how the root link is anchored.  A fixed-base
+            # conversion anchors the root link to the world through a fixed
+            # ``root_joint``; a second root API on the named link would make
+            # PhysX report the robot as floating.
+            from pxr import Usd, UsdPhysics  # type: ignore[import-not-found]
+
+            usd_stage = Usd.Stage.Open(robot_usd_path)
+            root_api_prims = [
+                str(prim.GetPath())
+                for prim in usd_stage.Traverse()
+                if prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+            ]
+            anchors = []
+            for joint in usd_stage.Traverse():
+                if not joint.IsA(UsdPhysics.FixedJoint):
+                    continue
+                j = UsdPhysics.FixedJoint(joint)
+                anchors.append(
+                    {
+                        "path": str(joint.GetPath()),
+                        "body0": str(j.GetBody0Rel().GetTargets() or ["<world>"])[1:-1].strip("'"),
+                        "body1": str(j.GetBody1Rel().GetTargets() or ["<world>"])[1:-1].strip("'"),
+                    }
+                )
+            meta["articulation_forensics"] = {
+                "articulation_root_prims": root_api_prims,
+                "fixed_joints": anchors,
+                "default_prim": str(usd_stage.GetDefaultPrim().GetPath()),
+            }
         if entity_payloads:
             # Multi-asset forensics for the host/probe: per-entity prim
             # presence, ImplicitActuator gain readback (env 0, contract joint
@@ -1443,17 +1479,20 @@ class _WorkerContext:
         return readback
 
     def _spawn_local_ground_plane(self, prim_path: str = "/World/ground") -> None:
-        """Author the original scene's colliding ground plane without Nucleus.
+        """Author the original scene's colliding ground without Nucleus.
 
         ``spawn_ground_plane`` + ``GroundPlaneCfg`` (scene_utils.py:1807)
-        creates ``/World/ground`` with a collision plane and the default
+        creates ``/World/ground`` with a collision plane bound to the default
         rigid-body material, but its default visual grid USD is a Nucleus
-        asset that breaks offline cold starts.  This authors the same physics
-        locally — an upward ``UsdGeomPlane`` with ``CollisionAPI``/``PlaneAPI``
-        and the Isaac Lab default rigid-body material (static/dynamic friction
-        0.5, restitution 0.0) — plus a flat neutral visual quad so rendered
-        playback has a grounded reference.  Spawned in training (headless) and
-        playback alike, matching the original scene contract.
+        asset that breaks offline cold starts, and this Kit build's UsdPhysics
+        exposes neither ``PlaneAPI`` nor a writable ``UsdGeomPlane`` normal.
+        This authors the ground as a large thin collision box whose top
+        surface is z=0, bound to the Isaac Lab default rigid-body material
+        (static/dynamic friction 0.5, restitution 0.0) — functionally
+        equivalent for this task, whose falling objects terminate at
+        z < 0.1 long before a bounded extent could matter.  Spawned in
+        training (headless) and playback alike, matching the original scene
+        contract; the box's own display color provides the visual floor.
         """
         from isaaclab.sim.spawners.materials import (
             RigidBodyMaterialCfg,  # type: ignore[import-not-found]
@@ -1465,13 +1504,22 @@ class _WorkerContext:
         if stage.GetPrimAtPath(prim_path).IsValid():
             raise ValueError(f"A prim already exists at path: '{prim_path}'.")
 
-        # Infinite upward collision plane (PhysX treats it as unbounded).
-        plane = UsdGeom.Plane.Define(stage, Sdf.Path(prim_path))
-        plane.CreateWidthAttr(2.0)
-        plane.CreateLengthAttr(2.0)
-        plane_prim = plane.GetPrim()
-        UsdPhysics.CollisionAPI.Apply(plane_prim)
-        UsdPhysics.PlaneAPI.Apply(plane_prim)
+        # Flat ground collider as a large thin box whose top surface is z=0.
+        # The original uses an infinite UsdPhysics plane; this Kit build's
+        # UsdPhysics exposes neither PlaneAPI nor a writable UsdGeomPlane
+        # normal, and a bounded box is functionally equivalent here — falling
+        # objects rest on the same z=0 surface long before reaching the
+        # ±100 m extent (fall terminates at object z < 0.1).
+        half = 100.0
+        thickness = 0.1
+        box = UsdGeom.Cube.Define(stage, Sdf.Path(prim_path))
+        box.CreateSizeAttr(1.0)
+        box_prim = box.GetPrim()
+        xform = UsdGeom.XformCommonAPI(box_prim)
+        xform.SetTranslate(Gf.Vec3d(0.0, 0.0, -thickness / 2.0))
+        xform.SetScale(Gf.Vec3f(half * 2.0, half * 2.0, thickness))
+        box.CreateDisplayColorAttr([Gf.Vec3f(0.32, 0.34, 0.36)])
+        UsdPhysics.CollisionAPI.Apply(box_prim)
 
         # Isaac Lab's default rigid-body material: the same 0.5/0.5/0.0
         # triple GroundPlaneCfg binds to the original ground (from_files_cfg
@@ -1480,23 +1528,6 @@ class _WorkerContext:
         material_path = f"{prim_path}/physicsMaterial"
         material_cfg.func(material_path, material_cfg)
         bind_physics_material(prim_path, material_path)
-
-        # Flat visual quad so rendered playback shows a grounded floor without
-        # any external asset.  Neutral gray; the dome light shades it.
-        visual_path = f"{prim_path}/visual"
-        mesh = UsdGeom.Mesh.Define(stage, Sdf.Path(visual_path))
-        half = 50.0
-        mesh.CreatePointsAttr(
-            [
-                Gf.Vec3f(-half, -half, 0.0),
-                Gf.Vec3f(half, -half, 0.0),
-                Gf.Vec3f(half, half, 0.0),
-                Gf.Vec3f(-half, half, 0.0),
-            ]
-        )
-        mesh.CreateFaceVertexCountsAttr([4])
-        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
-        mesh.CreateDisplayColorAttr([Gf.Vec3f(0.32, 0.34, 0.36)])
 
     def _physics_scene_path(self) -> str:
         """Find the stage's PhysX scene prim on the materialization path."""
@@ -2545,6 +2576,11 @@ class _WorkerContext:
             "render_height": self.render_height,
             "env_origins": self.env_origins.tolist(),
             "collision_filtering_applied": self.collision_filtering_applied,
+            # Runtime fixity diagnostics (training-pipeline-reaudit): the
+            # payload flag vs IsaacLab's own view of the articulation root.
+            # These must agree and be True for SimToolReal's fixed-base robot.
+            "fixed_base": bool(self._fixed_base),
+            "robot_is_fixed_base": bool(getattr(self.robot, "is_fixed_base", False)),
         }
 
     # ------------------------------------------------------------------
