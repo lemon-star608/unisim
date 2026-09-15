@@ -1848,9 +1848,13 @@ class MjcfSubprocessBackend(SimBackend):
         ``force`` has shape ``(num_envs, len(body_ids), 3)`` in the world
         frame, and ``torque`` is optional with the same shape.  Values
         accumulate into the dense ``WRENCH_FORCE_SLOT``/``WRENCH_TORQUE_SLOT``
-        shm rows; the worker applies them at the next control step and clears
-        the slots afterwards, and ``set_state`` zeroes the selected rows so a
-        freshly reset row never receives a pre-reset impulse.
+        shm rows **within one interval plan**: each non-empty plan starts
+        from cleared staging (the prologue in
+        :meth:`apply_interval_randomization`), so submissions from separate
+        plans replace rather than add to each other.  The worker applies the
+        staged rows at the next control step and clears the slots afterwards,
+        and ``set_state`` zeroes the selected rows so a freshly reset row
+        never receives a pre-reset impulse.
         """
         if not self._rigid_root_entities:
             raise NotImplementedError(
@@ -1918,7 +1922,17 @@ class MjcfSubprocessBackend(SimBackend):
 
         Thin prologue override per the base contract: a non-empty plan on a
         rigid scene starts from cleared wrench slots, then the base handler
-        table dispatch accumulates the ops through the staging entry.
+        table dispatch accumulates the ops through the staging entry.  The
+        per-plan prologue is exactly the form the base contract sanctions
+        ("Backends that need per-plan prologue/epilogue semantics (for
+        example clearing staged external forces before the ops accumulate)
+        keep a thin override that calls this base implementation"), so
+        :meth:`apply_body_force` accumulation is bounded by one plan.
+        Caveat: the prologue clears the whole staging, so if multiple wrench
+        terms each arrive as their own plan, the later plan's prologue drops
+        the earlier plan's staged rows — under the current contract a plan
+        carries at most one wrench term (SimToolReal's plans do), so this
+        cannot fire today.
         """
         if plan.is_empty():
             return
