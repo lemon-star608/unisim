@@ -9,6 +9,22 @@ from unisim.backend.subprocess_ipc.backend import MjcfSubprocessBackend
 from unisim.backend.subprocess_ipc.sensors import scan_scene_entities, scan_scene_metadata
 from unisim.scene import ActuatorGainOverride, SceneCfg, SceneEntitySpec
 
+
+class _EntityAssetHarnessBackend(MjcfSubprocessBackend):
+    """Family harness opting into composition consumption for host-side tests.
+
+    The constructor gate rejects declared entity assets/ground planes unless
+    the adapter opts in; these tests exercise the family's serialization and
+    binding machinery that the IsaacSim realization stands on.
+    """
+
+    def _supports_entity_assets(self) -> bool:
+        return True
+
+    def _supports_ground_plane(self) -> bool:
+        return True
+
+
 URDF = """<?xml version="1.0"?>
 <robot name="two_link">
   <link name="base_link"/>
@@ -248,7 +264,7 @@ def _host_backend(urdf_file, object_urdf_file, table_mjcf_file):
         entity_assets=_simtoolreal_specs(urdf_file, object_urdf_file, table_mjcf_file),
     )
     # Host-only construction: no worker is spawned before materialize().
-    return MjcfSubprocessBackend(scene, num_envs=2, sim_dt=0.01)
+    return _EntityAssetHarnessBackend(scene, num_envs=2, sim_dt=0.01)
 
 
 def test_host_primary_payload_applies_entity_gain_overrides(
@@ -289,7 +305,9 @@ def test_host_entity_payloads_shape(urdf_file, object_urdf_file, table_mjcf_file
 
 
 def test_host_without_entity_assets_keeps_legacy_payload(urdf_file):
-    backend = MjcfSubprocessBackend(SceneCfg(model_file=str(urdf_file)), num_envs=2, sim_dt=0.01)
+    backend = _EntityAssetHarnessBackend(
+        SceneCfg(model_file=str(urdf_file)), num_envs=2, sim_dt=0.01
+    )
     assert backend._entity_payloads() == []
     payload = backend._position_actuation_payload()
     assert payload["dof_stiffness"] == [0.0, 0.0]
@@ -310,12 +328,14 @@ def test_host_primary_urdf_honors_declared_root_mode(object_urdf_file):
             ),
         ),
     )
-    backend = MjcfSubprocessBackend(scene, num_envs=1, sim_dt=0.01)
+    backend = _EntityAssetHarnessBackend(scene, num_envs=1, sim_dt=0.01)
     assert backend._get_scene_metadata().freejoint_body_name == "cube_link"
 
 
 def test_host_gain_override_unknown_joint_fails_closed(urdf_file):
-    backend = MjcfSubprocessBackend(SceneCfg(model_file=str(urdf_file)), num_envs=1, sim_dt=0.01)
+    backend = _EntityAssetHarnessBackend(
+        SceneCfg(model_file=str(urdf_file)), num_envs=1, sim_dt=0.01
+    )
     metadata = backend._get_scene_metadata()
     with pytest.raises(ValueError, match="not in the scanned asset"):
         backend._position_actuation_payload(

@@ -133,6 +133,11 @@ def _worker_meta():
         "render_height": 720,
         "env_origins": [[float(index), 0.0, 0.0] for index in range(NUM_ENVS)],
         "collision_filtering_applied": True,
+        # Authoritative pool echo the host validates against the immutable
+        # plan whenever a pooled scene materializes.
+        "fixed_variant_count": 3,
+        "fixed_variant_assignment": [0, 1, 2, 0],
+        "fixed_variant_target_entity": "object",
     }
 
 
@@ -148,6 +153,32 @@ def _masses_meta(masses=(0.2, 0.3, 0.5), *, with_masses=True, with_assignment=Tr
         if with_masses:
             assignment["masses"] = [float(value) for value in masses]
         meta["variant_assignment"] = assignment
+    return meta
+
+
+def _echo_meta(
+    *,
+    count=3,
+    assignment=(0, 1, 2, 0),
+    target="object",
+    with_echo=True,
+    observed=(0, 1, 2, 0),
+    masses=(0.2, 0.3, 0.5),
+):
+    """Fake INIT meta carrying the worker-authoritative pool echo."""
+    meta = _masses_meta(masses)
+    if observed is not None:
+        meta["variant_assignment"]["observed"] = list(observed)
+    else:
+        meta["variant_assignment"]["observed"] = None
+    if with_echo:
+        meta["fixed_variant_count"] = count
+        meta["fixed_variant_assignment"] = list(assignment)
+        meta["fixed_variant_target_entity"] = target
+    else:
+        for key in ("fixed_variant_count", "fixed_variant_assignment",
+                    "fixed_variant_target_entity"):
+            meta.pop(key, None)
     return meta
 
 
@@ -341,11 +372,160 @@ def test_missing_source_file_fails_closed(variant_files, robot_file, tmp_path):
         backend.materialize()
 
 
+# ---------------------------------------------------------------------------
+# Host-side source pre-validation: every failure below must fire before any
+# worker process is spawned (no INIT request leaves the host)
+# ---------------------------------------------------------------------------
+
+
+def _sources_with(variant_files, replacement):
+    sources = [str(path) for path in variant_files]
+    sources[1] = str(replacement)
+    return sources
+
+
+def test_non_urdf_source_fails_closed_before_spawn(
+    variant_files, robot_file, tmp_path, monkeypatch
+):
+    # Audit probe: an existing .txt file used to pass staging and only die
+    # inside the Kit worker after an expensive startup.
+    txt = tmp_path / "not-urdf.txt"
+    txt.write_text(OBJECT_URDF)
+    monkeypatch.setattr(subprocess, "Popen", _FakeWorkerProcess)
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0], sources=_sources_with(variant_files, txt)),
+    )
+    try:
+        with pytest.raises(ValueError, match="URDF"):
+            backend.materialize()
+        assert backend.requests == []
+    finally:
+        backend.close()
+
+
+def test_unparseable_variant_urdf_fails_closed_before_spawn(
+    variant_files, robot_file, tmp_path
+):
+    broken = tmp_path / "broken.urdf"
+    broken.write_text("<robot name='x'><link")
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0], sources=_sources_with(variant_files, broken)),
+    )
+    with pytest.raises(ValueError, match="parse"):
+        backend.materialize()
+    assert backend.requests == []
+
+
+def test_variant_with_movable_joints_fails_closed_before_spawn(
+    variant_files, robot_file, tmp_path
+):
+    articulated = tmp_path / "articulated.urdf"
+    articulated.write_text(ROBOT_URDF)
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(
+            variant_files, [0, 1, 2, 0], sources=_sources_with(variant_files, articulated)
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="movable joints"):
+        backend.materialize()
+    assert backend.requests == []
+
+
+def test_variant_with_multiple_roots_fails_closed_before_spawn(
+    variant_files, robot_file, tmp_path
+):
+    multi_root = tmp_path / "multi_root.urdf"
+    multi_root.write_text(
+        '<?xml version="1.0"?>\n<robot name="two">'
+        '<link name="a"/><link name="b"/>\n</robot>'
+    )
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0], sources=_sources_with(variant_files, multi_root)),
+    )
+    with pytest.raises(ValueError, match="root link"):
+        backend.materialize()
+    assert backend.requests == []
+
+
+def test_variant_layout_drift_fails_closed_before_spawn(
+    variant_files, robot_file, tmp_path
+):
+    drifted = tmp_path / "drift.urdf"
+    drifted.write_text(OBJECT_URDF.replace("cube_link", "other_root"))
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0], sources=_sources_with(variant_files, drifted)),
+    )
+    with pytest.raises(ValueError, match="layout"):
+        backend.materialize()
+    assert backend.requests == []
+
+
+def test_variant_fixed_joint_children_merge_into_the_pool_layout(
+    variant_files, robot_file, tmp_path, monkeypatch
+):
+    # Fixed-joint children merge away under merge_fixed_joints=True, so a
+    # variant carrying them keeps the single-rigid-body public layout.
+    merged = tmp_path / "merged.urdf"
+    merged.write_text(
+        OBJECT_URDF.replace(
+            "</robot>",
+            '<link name="cap"/><joint name="weld" type="fixed">'
+            "<parent link='cube_link'/><child link='cap'/></joint></robot>",
+        )
+    )
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0], sources=_sources_with(variant_files, merged)),
+        monkeypatch,
+    )
+    try:
+        assert _init_payload(backend)["variant_pool"]["source_files"][1] == str(
+            merged.resolve()
+        )
+    finally:
+        backend.close()
+
+
 def test_assignment_shape_mismatch_fails_closed(variant_files, robot_file):
     # The upstream family constructor gate validates plan assignment shapes at
     # construction time; the same mismatch used to surface at materialize.
     with pytest.raises(ValueError, match=r"shape \(4,\)"):
         _backend(robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2]))
+
+
+def test_uniform_public_layout_plan_fails_closed_at_staging(variant_files, robot_file):
+    # The pool realizes one rigid body per variant (SAME_LAYOUT); a plan that
+    # promises UNIFORM_PUBLIC_LAYOUT optional slots cannot be materialized and
+    # must be rejected at staging even though the capability negotiation path
+    # (fixed_variant_rejections) would also catch it later.
+    plan = FixedVariantPlan(
+        assignment=np.asarray([0, 1, 2, 0], dtype=np.int64),
+        variants=tuple(
+            ModelSourceDescriptor(model_file=str(path)) for path in variant_files
+        ),
+        layout=FixedVariantLayout.UNIFORM_PUBLIC_LAYOUT,
+    )
+    backend = _backend(robot_file, [_object_spec(str(variant_files[0]))], plan)
+    with pytest.raises(NotImplementedError, match="SAME_LAYOUT"):
+        backend.materialize()
+    with pytest.raises(NotImplementedError, match="SAME_LAYOUT"):
+        build_init_variant_pool_payload(
+            plan,
+            num_envs=NUM_ENVS,
+            entity_assets=(_object_spec(str(variant_files[0])),),
+            backend_label="isaacsim",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +631,7 @@ def test_capabilities_pooled_scene_declares_fixed_variants(variant_files, robot_
         assert capabilities.supported_fixed_variant_layouts == frozenset(
             {FixedVariantLayout.SAME_LAYOUT}
         )
-        assert capabilities.supports_per_env_playback is False
+        assert capabilities.supports_per_env_playback is True
         layouts = capabilities.supported_fixed_variant_layouts
         assert FixedVariantLayout.UNIFORM_PUBLIC_LAYOUT not in layouts
         # The pool declaration merges with (not replaces) the interval one.
@@ -478,7 +658,7 @@ def test_capabilities_pool_survives_without_rigid_roots(variant_files, robot_fil
         assert capabilities.supported_fixed_variant_layouts == frozenset(
             {FixedVariantLayout.SAME_LAYOUT}
         )
-        assert capabilities.supports_per_env_playback is False
+        assert capabilities.supports_per_env_playback is True
         # Interval wrench support stays strictly rigid-root-gated.
         assert capabilities.supports_interval_body_force is False
         assert capabilities.supports_interval_body_torque is False
@@ -606,6 +786,191 @@ def test_base_get_entity_variant_metadata_default_fails_closed():
     )
     with pytest.raises(NotImplementedError, match="does not expose fixed variant metadata"):
         stub().get_entity_variant_metadata("object")
+
+
+# ---------------------------------------------------------------------------
+# Handshake guard (authoritative echo): the audit's tamper scenario
+# ---------------------------------------------------------------------------
+
+
+def test_handshake_tampered_assignment_fails_closed(variant_files, robot_file, monkeypatch):
+    # Audit attack scenario: the worker materializes [2, 2, 2, 2] while the
+    # immutable plan says [0, 1, 2, 0].  The authoritative echo must disagree
+    # with the plan and INIT must fail instead of exposing wrong identities.
+    with pytest.raises(Exception, match="assignment"):
+        _materialized(
+            robot_file,
+            [_object_spec(str(variant_files[0]))],
+            _plan(variant_files, [0, 1, 2, 0]),
+            monkeypatch,
+            init_meta=_echo_meta(assignment=(2, 2, 2, 2)),
+        )
+
+
+def test_handshake_missing_echo_fails_closed(variant_files, robot_file, monkeypatch):
+    # A worker that materializes a pool but never echoes the authoritative
+    # fields cannot be validated; silent pass-through is the old behavior.
+    with pytest.raises(Exception, match="fixed-variant handshake"):
+        _materialized(
+            robot_file,
+            [_object_spec(str(variant_files[0]))],
+            _plan(variant_files, [0, 1, 2, 0]),
+            monkeypatch,
+            init_meta=_echo_meta(with_echo=False),
+        )
+
+
+def test_handshake_wrong_count_fails_closed(variant_files, robot_file, monkeypatch):
+    with pytest.raises(Exception, match="variants"):
+        _materialized(
+            robot_file,
+            [_object_spec(str(variant_files[0]))],
+            _plan(variant_files, [0, 1, 2, 0]),
+            monkeypatch,
+            init_meta=_echo_meta(count=2),
+        )
+
+
+def test_handshake_wrong_target_fails_closed(variant_files, robot_file, monkeypatch):
+    with pytest.raises(Exception, match="target"):
+        _materialized(
+            robot_file,
+            [_object_spec(str(variant_files[0]))],
+            _plan(variant_files, [0, 1, 2, 0]),
+            monkeypatch,
+            init_meta=_echo_meta(target="tool"),
+        )
+
+
+def test_handshake_echo_shape_mismatch_fails_closed(variant_files, robot_file, monkeypatch):
+    with pytest.raises(Exception, match="assignment"):
+        _materialized(
+            robot_file,
+            [_object_spec(str(variant_files[0]))],
+            _plan(variant_files, [0, 1, 2, 0]),
+            monkeypatch,
+            init_meta=_echo_meta(assignment=(0, 1, 2)),
+        )
+
+
+def test_handshake_observed_disagreement_fails_closed(variant_files, robot_file, monkeypatch):
+    # observed forensics stay diagnostic, but a computed observation that
+    # contradicts the authoritative echo is an internal inconsistency and
+    # fails closed rather than being logged away.
+    with pytest.raises(Exception, match="observed"):
+        _materialized(
+            robot_file,
+            [_object_spec(str(variant_files[0]))],
+            _plan(variant_files, [0, 1, 2, 0]),
+            monkeypatch,
+            init_meta=_echo_meta(observed=(2, 2, 2, 2)),
+        )
+
+
+def test_handshake_observed_none_stands_on_the_echo(variant_files, robot_file, monkeypatch):
+    # observed=None (production env counts flatten the prim stacks) must not
+    # be a silent pass: the handshake stands on the authoritative echo alone
+    # and the pooled metadata stays queryable.
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+        init_meta=_echo_meta(observed=None),
+    )
+    try:
+        np.testing.assert_allclose(backend.get_entity_variant_metadata("object").mass,
+                                   [0.2, 0.3, 0.5, 0.2])
+    finally:
+        backend.close()
+
+
+def test_pool_identity_survives_set_state(variant_files, robot_file, monkeypatch):
+    # Fixed identity is construction-time: a reset transaction must not be
+    # able to change the pool assignment, count, or measured masses.
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+        init_meta=_echo_meta(),
+    )
+    try:
+        before = backend.get_entity_variant_metadata("object")
+        backend.set_state(
+            env_indices=np.asarray([0, 1], dtype=np.int32),
+            entity_root_states={
+                "object": np.zeros((2, 13), dtype=np.float32),
+            },
+        )
+        after = backend.get_entity_variant_metadata("object")
+        np.testing.assert_array_equal(before.mass, after.mass)
+        assert before.variant_files == after.variant_files
+    finally:
+        backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-env playback: pooled scenes resolve each environment's variant source
+# ---------------------------------------------------------------------------
+
+
+def test_pooled_get_playback_model_returns_assigned_source(
+    variant_files, robot_file, monkeypatch
+):
+    backend = _materialized(
+        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+        init_meta=_echo_meta(),
+    )
+    try:
+        for env_index, variant_index in enumerate([0, 1, 2, 0]):
+            assert (
+                backend.get_playback_model(env_index)
+                == str(variant_files[variant_index])
+            )
+    finally:
+        backend.close()
+
+
+def test_pooled_get_playback_model_requires_explicit_env(variant_files, robot_file):
+    backend = _backend(
+        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2, 0])
+    )
+    try:
+        with pytest.raises(ValueError, match="env_index"):
+            backend.get_playback_model()
+    finally:
+        backend.close()
+
+
+def test_pooled_get_playback_model_validates_env_index(variant_files, robot_file):
+    backend = _backend(
+        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2, 0])
+    )
+    try:
+        with pytest.raises(IndexError):
+            backend.get_playback_model(NUM_ENVS)
+        with pytest.raises(TypeError):
+            backend.get_playback_model(1.5)
+        with pytest.raises(TypeError):
+            backend.get_playback_model(True)
+    finally:
+        backend.close()
+
+
+def test_unpolled_scene_playback_model_stays_the_backend_model(robot_file):
+    # No plan: the base default still returns the backend model (the
+    # historical contract), instead of guessing a variant.
+    meta = _worker_meta()
+    meta.pop("entities")
+    backend = _FakeWorkerBackend(
+        SceneCfg(model_file=str(robot_file)), num_envs=NUM_ENVS, init_meta=meta
+    )
+    try:
+        assert backend.get_playback_model(0) is backend.model
+    finally:
+        backend.close()
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,22 @@ from unisim.backend.subprocess_ipc.backend import MjcfSubprocessBackend
 from unisim.backend.subprocess_ipc.sensors import scan_scene_entities
 from unisim.scene import BodyFrictionOverride, SceneCfg, SceneEntitySpec
 
+
+class _EntityAssetHarnessBackend(MjcfSubprocessBackend):
+    """Family harness opting into composition consumption for host-side tests.
+
+    The constructor gate rejects declared entity assets/ground planes unless
+    the adapter opts in; these tests exercise the family's serialization and
+    binding machinery that the IsaacSim realization stands on.
+    """
+
+    def _supports_entity_assets(self) -> bool:
+        return True
+
+    def _supports_ground_plane(self) -> bool:
+        return True
+
+
 ROBOT_URDF = """<?xml version="1.0"?>
 <robot name="mini_hand">
   <link name="base_link"/>
@@ -174,7 +190,7 @@ def test_host_entity_payloads_serialize_friction(robot_urdf_file, object_urdf_fi
         ),
     )
     # Host-only construction: no worker is spawned before materialize().
-    backend = MjcfSubprocessBackend(scene, num_envs=2, sim_dt=0.01)
+    backend = _EntityAssetHarnessBackend(scene, num_envs=2, sim_dt=0.01)
     payloads = {entry["name"]: entry for entry in backend._entity_payloads()}
     assert payloads["robot"]["friction"] == [0.5, 0.5, 0.0]
     assert payloads["robot"]["friction_by_body"] == {"finger_DP": [1.5, 1.5, 0.0]}

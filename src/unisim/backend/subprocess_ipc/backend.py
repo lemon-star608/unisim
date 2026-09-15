@@ -59,6 +59,7 @@ from unisim.scene import (
     ActuatorGainOverride,
     SceneCfg,
     SceneEntitySpec,
+    validate_scene_composition_support,
 )
 from unisim.utils.rotation import (
     np_quat_apply_batched,
@@ -110,17 +111,18 @@ def build_init_variant_pool_payload(
     """Validate a fixed variant plan into a worker INIT payload entry.
 
     Pure cold-path validation shared by every subprocess backend that
-    materializes whole-file model variant pools (SimToolReal M1.1).  The
-    plan's per-environment assignment maps to one ``MultiUsdFileCfg``-style
-    pool on the worker, so exactly one declared scene entity must bind
-    itself to the pool with ``consumes_fixed_variant_pool=True``; that
-    entity must be a floating rigid object whose declared format matches
-    the variant files.  Every check fails closed: undeclared or ambiguous
-    targets, non-URDF sources, missing files, and malformed assignments are
-    all rejected before any worker is spawned.  The payload never carries a
-    ``masses`` key: variant mass is backend-authoritative (read back from
-    the materialized asset), and owner-side measurement flows through the
-    worker probe in M1.3.
+    materializes whole-file model variant pools.  The plan's per-environment
+    assignment maps to one ``MultiUsdFileCfg``-style pool on the worker, so
+    exactly one declared scene entity must bind itself to the pool with
+    ``consumes_fixed_variant_pool=True``; that entity must be a floating
+    rigid object whose declared format matches the variant files.  Every
+    check fails closed before any worker is spawned: undeclared or ambiguous
+    targets, non-URDF sources, missing files, malformed assignments, and —
+    through the host-side URDF scan — unparseable documents, multiple root
+    links, unsupported joint types, movable-joint (articulated) variants,
+    and root/body layout drift across the catalog or against the target's
+    bootstrap asset.  The payload never carries a ``masses`` key: variant
+    mass is backend-authoritative and measured from the materialized asset.
     """
     declared = [spec for spec in entity_assets if spec.consumes_fixed_variant_pool]
     if not declared:
@@ -158,12 +160,57 @@ def build_init_variant_pool_payload(
         # FixedVariantPlan already rejects empty catalogs; keep the explicit
         # guard so the pool semantics cannot drift.
         raise ValueError(f"{backend_label} init variant pool requires at least one variant")
+    # The rigid-object pool realization guarantees one identical public body
+    # layout per variant; it cannot provide UNIFORM_PUBLIC_LAYOUT optional
+    # slots, so such a plan fails closed at staging rather than being
+    # silently narrowed.  Capability negotiation rejects it through the same
+    # declared-layout set, but direct materialization must not depend on the
+    # caller consulting the capability report first.
+    if variant_plan.layout is not FixedVariantLayout.SAME_LAYOUT:
+        raise NotImplementedError(
+            f"{backend_label} fixed variant pool supports SAME_LAYOUT plans only; "
+            f"got {variant_plan.layout.value!r}"
+        )
+    # Host-side source validation, fail-closed before any worker process is
+    # spawned: every variant must be a parseable single-root URDF whose
+    # movable-joint-free tree merges to exactly one rigid body, and the
+    # public root/body layout must be identical across the catalog and the
+    # target entity's bootstrap asset.  Sources that only fail inside the
+    # URDF converter (wrong extension, malformed XML, unsupported joint
+    # types, or a drifted layout) would otherwise surface after the Kit
+    # worker has already paid its startup cost.
+    bootstrap = scan_scene_metadata(
+        str(Path(spec.model_file).expanduser()),
+        backend_label=backend_label,
+        urdf_fixed_base=spec.fixed_base,
+    )
+    expected_layout = (bootstrap.urdf_root_link_name, bootstrap.body_names)
     source_files: list[str] = []
     for index, variant in enumerate(variants):
         path = Path(variant.model_file).expanduser()
+        if path.suffix.lower() != ".urdf":
+            raise ValueError(
+                f"{backend_label} variant {index} source must be a URDF file: {path}"
+            )
         if not path.is_file():
             raise ValueError(
                 f"{backend_label} variant {index} source file does not exist: {path}"
+            )
+        # Pool variants are always floating rigid objects (enforced above).
+        scanned = scan_scene_metadata(
+            str(path), backend_label=backend_label, urdf_fixed_base=False
+        )
+        if scanned.joint_names:
+            raise NotImplementedError(
+                f"{backend_label} variant {index} ({path.name}) declares movable joints "
+                f"{list(scanned.joint_names)}; a pool variant must be one rigid body "
+                "because the target entity materializes as a floating rigid object"
+            )
+        layout = (scanned.urdf_root_link_name, scanned.body_names)
+        if layout != expected_layout:
+            raise ValueError(
+                f"{backend_label} variant {index} ({path.name}) changes the public "
+                f"root/body layout: bootstrap={expected_layout}, variant={layout}"
             )
         source_files.append(str(path.resolve()))
 
@@ -318,6 +365,14 @@ class MjcfSubprocessBackend(SimBackend):
         """Return whether this adapter's worker realizes fixed variant plans."""
         return False
 
+    def _supports_entity_assets(self) -> bool:
+        """Return whether this adapter's worker materializes declared entity assets."""
+        return False
+
+    def _supports_ground_plane(self) -> bool:
+        """Return whether this adapter's worker consumes ``SceneCfg.ground_plane``."""
+        return False
+
     def _worker_init_payload(self) -> dict[str, Any]:
         """Return backend-owned cold-path INIT options.
 
@@ -385,6 +440,15 @@ class MjcfSubprocessBackend(SimBackend):
             raise NotImplementedError(
                 f"{self._BACKEND_LABEL} backend does not support generated terrain scenes yet"
             )
+        # Composition declarations are scene content: an adapter whose worker
+        # does not materialize them fails closed here instead of silently
+        # degrading to single-asset behavior.
+        validate_scene_composition_support(
+            scene,
+            self._BACKEND_LABEL,
+            supports_entity_assets=self._supports_entity_assets(),
+            supports_ground_plane=self._supports_ground_plane(),
+        )
         if scene.fixed_variant_plan is not None:
             scene.fixed_variant_plan.validate(int(num_envs))
             if not self._supports_fixed_variant_plans():
@@ -1072,13 +1136,14 @@ class MjcfSubprocessBackend(SimBackend):
         return {"variant_pool": dict(self._init_variant_pool)}
 
     def _ground_plane_payload(self) -> dict[str, Any] | None:
-        """Serialize ``SceneCfg.ground_plane`` into the INIT payload (Fix-A).
+        """Serialize ``SceneCfg.ground_plane`` into the INIT payload.
 
-        ``None`` keeps each backend's native ground behavior; a declaration
+        ``None`` keeps the backend's native ground behavior; a declaration
         carries the PhysX triple, the restitution scalar, and the extent in
-        meters.  The key is always present so the wire contract is explicit,
-        and workers without a declarative ground (isaacgym, mujoco family)
-        ignore it like every other composition key they do not consume.
+        meters.  The key is always present so the wire contract is explicit.
+        Only adapters whose worker consumes the declaration reach this
+        serialization; every other backend rejected the scene at
+        construction (:func:`validate_scene_composition_support`).
         """
         declaration = self._scene.ground_plane
         if declaration is None:
@@ -1744,10 +1809,12 @@ class MjcfSubprocessBackend(SimBackend):
 
         Scenes carrying a ``fixed_variant_plan`` (the variant-pool channel
         staged by :meth:`materialize`) additionally declare fixed-variant
-        support under the ``SAME_LAYOUT`` guarantee, whether or not rigid
-        root entities are bound yet.  ``supports_per_env_playback`` and
-        ``UNIFORM_PUBLIC_LAYOUT`` stay undeclared: the family's playback
-        semantics and public-layout guarantee are deliberate deferrals.
+        support under the ``SAME_LAYOUT`` guarantee together with
+        per-environment playback — ``get_playback_model(env_index)`` resolves
+        each environment to its assigned variant source — whether or not
+        rigid root entities are bound yet.  ``UNIFORM_PUBLIC_LAYOUT`` stays
+        undeclared: the rigid-object pool realizes one identical public body
+        layout per variant and cannot provide optional public slots.
         """
         pooled = self._scene.fixed_variant_plan is not None
         if not self._rigid_root_entities and not pooled:
@@ -1765,8 +1832,33 @@ class MjcfSubprocessBackend(SimBackend):
             fields.update(
                 supports_fixed_variants=True,
                 supported_fixed_variant_layouts=frozenset({FixedVariantLayout.SAME_LAYOUT}),
+                supports_per_env_playback=True,
             )
         return DomainRandomizationCapabilities(**fields)
+
+    def get_playback_model(self, env_index: int | None = None) -> Any:
+        """Return the assigned variant source for one environment.
+
+        Pooled scenes — the IsaacGym model-level plan and the IsaacSim
+        entity-bound pool both carry ``SceneCfg.fixed_variant_plan`` —
+        resolve each environment to its assigned variant's model file; the
+        request must name one environment explicitly.  Scenes without a
+        plan keep the base behavior and return the backend model.
+        """
+        plan = self._scene.fixed_variant_plan
+        if plan is None:
+            return super().get_playback_model(env_index)
+        if env_index is None:
+            raise ValueError(
+                f"{self._BACKEND_LABEL} fixed-variant playback requires an explicit "
+                "env_index"
+            )
+        if isinstance(env_index, bool) or not isinstance(env_index, int):
+            raise TypeError("env_index must be an integer or None")
+        if env_index < 0 or env_index >= self._num_envs:
+            raise IndexError(f"env_index must be in [0, {self._num_envs - 1}]")
+        variant_index = int(plan.assignment[env_index])
+        return plan.variants[variant_index].model_file
 
     def get_entity_variant_metadata(self, entity: str) -> FixedVariantMetadata:
         """Expand the worker-measured variant masses per environment.

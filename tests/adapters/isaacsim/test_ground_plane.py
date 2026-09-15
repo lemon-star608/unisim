@@ -126,6 +126,11 @@ class _FakeWorkerProcess:
 class _FakeWorkerBackend(MjcfSubprocessBackend):
     """Record every worker request and answer the INIT/ATTACH handshake."""
 
+    def _supports_ground_plane(self) -> bool:
+        # The serialization under test belongs to the workers that consume
+        # the declaration; the family default rejects declared scenes.
+        return True
+
     def __init__(self, scene: SceneCfg, num_envs: int = NUM_ENVS):
         self.requests: list[tuple[str, dict]] = []
         super().__init__(scene, num_envs=num_envs, sim_dt=0.01)

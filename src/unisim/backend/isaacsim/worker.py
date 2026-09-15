@@ -1528,14 +1528,26 @@ class _WorkerContext:
             meta["scene_physx"] = self._readback_scene_physx()
             if self._variant_pool_usds is not None:
                 target_name, pool_usds, measured_masses = self._variant_pool_usds
+                # Authoritative pool echo: the spawner materialized each env
+                # from its assigned pool USD by construction (the round-robin
+                # prototype selection or the expanded per-env list below), so
+                # echoing the assignment is exact rather than observed.  The
+                # host compares count, target, and the full assignment
+                # against the immutable plan at INIT binding.
+                echoed_assignment = [int(value) for value in variant_pool["assignments"]]
+                meta["fixed_variant_count"] = len(pool_usds)
+                meta["fixed_variant_assignment"] = echoed_assignment
+                meta["fixed_variant_target_entity"] = target_name
                 meta["variant_assignment"] = {
                     "target_entity": target_name,
-                    "expected": [int(value) for value in variant_pool["assignments"]],
+                    "expected": echoed_assignment,
+                    # Optional stage forensics: None when the prim stacks are
+                    # flattened or the env count exceeds the probe regime; the
+                    # handshake stands on the authoritative echo above.
                     "observed": self._observe_variant_assignment(target_name, pool_usds),
                     # Backend-authoritative measurement of the baked variant
-                    # USDs (interface-migration.md ruling 9): the payload
-                    # echo is gone, so this is the only mass source; one
-                    # finite value per pool source file.
+                    # USDs: the payload never carries masses, so this is the
+                    # only mass source; one finite value per pool source file.
                     "masses": [float(value) for value in measured_masses],
                 }
             if self._goalviz_mirror is not None:

@@ -22,6 +22,22 @@ from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQ
 from unisim.dr.types import IntervalRandomizationPlan
 from unisim.scene import SceneCfg, SceneEntitySpec
 
+
+class _EntityAssetHarnessBackend(MjcfSubprocessBackend):
+    """Family harness opting into composition consumption for host-side tests.
+
+    The constructor gate rejects declared entity assets/ground planes unless
+    the adapter opts in; these tests exercise the family's serialization and
+    binding machinery that the IsaacSim realization stands on.
+    """
+
+    def _supports_entity_assets(self) -> bool:
+        return True
+
+    def _supports_ground_plane(self) -> bool:
+        return True
+
+
 ROBOT_URDF = """<?xml version="1.0"?>
 <robot name="two_link">
   <link name="base_link"/>
@@ -118,7 +134,7 @@ def _worker_meta(with_entities=True):
 
 @pytest.fixture()
 def multi_asset_backend(asset_files):
-    backend = MjcfSubprocessBackend(
+    backend = _EntityAssetHarnessBackend(
         SceneCfg(model_file=asset_files["robot"], entity_assets=_entity_specs(asset_files)),
         num_envs=NUM_ENVS,
         sim_dt=0.01,
@@ -131,7 +147,7 @@ def multi_asset_backend(asset_files):
 
 @pytest.fixture()
 def legacy_backend(asset_files):
-    backend = MjcfSubprocessBackend(
+    backend = _EntityAssetHarnessBackend(
         SceneCfg(model_file=asset_files["robot"]), num_envs=NUM_ENVS, sim_dt=0.01
     )
     backend._bind_model_metadata(_worker_meta(with_entities=False))
@@ -358,7 +374,7 @@ def test_rigid_root_name_collision_fails_closed(asset_files, tmp_path):
         name="object", model_file=str(bad_object), asset_format="urdf",
         materialization="rigid", root_mode="floating",
     )
-    backend = MjcfSubprocessBackend(
+    backend = _EntityAssetHarnessBackend(
         SceneCfg(model_file=asset_files["robot"], entity_assets=tuple(specs)),
         num_envs=NUM_ENVS,
         sim_dt=0.01,
@@ -371,7 +387,7 @@ def test_rigid_root_name_collision_fails_closed(asset_files, tmp_path):
 
 
 def test_worker_entity_mismatch_fails_closed(asset_files):
-    backend = MjcfSubprocessBackend(
+    backend = _EntityAssetHarnessBackend(
         SceneCfg(model_file=asset_files["robot"], entity_assets=_entity_specs(asset_files)),
         num_envs=NUM_ENVS,
         sim_dt=0.01,
@@ -390,7 +406,7 @@ def test_worker_entity_mismatch_fails_closed(asset_files):
 
 
 def test_unexpected_worker_entities_fail_closed(asset_files):
-    backend = MjcfSubprocessBackend(
+    backend = _EntityAssetHarnessBackend(
         SceneCfg(model_file=asset_files["robot"]), num_envs=NUM_ENVS, sim_dt=0.01
     )
     try:
@@ -401,7 +417,7 @@ def test_unexpected_worker_entities_fail_closed(asset_files):
 
 
 def test_rigid_root_ids_unavailable_before_materialize(asset_files):
-    backend = MjcfSubprocessBackend(
+    backend = _EntityAssetHarnessBackend(
         SceneCfg(model_file=asset_files["robot"], entity_assets=_entity_specs(asset_files)),
         num_envs=NUM_ENVS,
         sim_dt=0.01,

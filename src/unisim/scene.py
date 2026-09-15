@@ -277,9 +277,10 @@ class GroundPlaneSceneCfg:
     """Declarative world-level ground plane for offline-safe scenes.
 
     Composition declaration consumed by adapters whose scene sources do not
-    carry a floor (e.g. the IsaacSim URDF multi-asset path); backends whose
-    model files already include a ground ignore it.  Defaults mirror
-    IsaacLab ``GroundPlaneCfg``'s physics material.
+    carry a floor (e.g. the IsaacSim URDF multi-asset path); backends that do
+    not consume a declarative ground plane reject the scene at construction
+    rather than silently dropping it.  Defaults mirror IsaacLab
+    ``GroundPlaneCfg``'s physics material.
 
     ``friction`` is the repo's PhysX material triple (static friction,
     dynamic friction, restitution slot) validated like every other contact
@@ -330,9 +331,10 @@ class SceneCfg:
     The IsaacSim worker consumes it as a world-level local collision ground
     in every runtime mode (task-level scene composition in the original
     repository: ``scene_utils.py`` ``setup_scene`` step 5); an undeclared
-    scene keeps each backend's native ground behavior, and backends whose
-    model files already include a ground ignore the declaration.  Upstream
-    composition-contract proposal: interface-migration.md K2.
+    scene keeps the backend's native ground behavior.  The declaration is
+    scene content, not a hint: backends that do not consume a declarative
+    ground plane fail closed at construction
+    (:func:`validate_scene_composition_support`).
     """
     entities: dict[str, object] = field(default_factory=dict)
     """Logical entity partitions materialized by the base-owned manager facade."""
@@ -344,8 +346,10 @@ class SceneCfg:
     is the typed contract backends consume on the cold path: each entry pairs
     an asset role with its source file, format tag, materialization type, and
     root mode.  Scenes that declare ``entity_assets`` still keep ``model_file``
-    as the primary asset (typically the actuated robot).  Backends without
-    multi-asset support ignore this field, preserving single-asset behavior.
+    as the primary asset (typically the actuated robot).  The declaration is
+    scene content, not a hint: backends that do not materialize declared
+    entity assets fail closed at construction
+    (:func:`validate_scene_composition_support`).
     """
     # Optional render-only model override. When set, offline playback/video
     # export renders this XML instead of ``model_file`` while physics keeps
@@ -357,6 +361,37 @@ class SceneCfg:
     """Optional named keyframe used as the Manager-Based default state."""
     fixed_variant_plan: FixedVariantPlan | None = None
     """Immutable fixed model identities realized by a backend at construction."""
+
+
+def validate_scene_composition_support(
+    scene: SceneCfg,
+    backend_label: str,
+    *,
+    supports_entity_assets: bool = False,
+    supports_ground_plane: bool = False,
+) -> None:
+    """Fail closed when a backend cannot consume declared scene composition.
+
+    ``SceneCfg.entity_assets`` and ``SceneCfg.ground_plane`` are composition
+    declarations: a backend that cannot materialize them must reject the scene
+    at construction instead of silently dropping content and degrading to
+    single-asset behavior.  Each adapter declares what it consumes; the
+    subprocess family routes the flags through the
+    ``_supports_entity_assets``/``_supports_ground_plane`` hooks so pooled
+    specializations own their declaration.
+    """
+    if scene.entity_assets and not supports_entity_assets:
+        raise NotImplementedError(
+            f"{backend_label} backend does not consume multi-asset scene composition "
+            "(SceneCfg.entity_assets); select a backend that materializes "
+            "declared entity assets"
+        )
+    if scene.ground_plane is not None and not supports_ground_plane:
+        raise NotImplementedError(
+            f"{backend_label} backend does not consume the declarative ground plane "
+            "(SceneCfg.ground_plane); this backend's scene floor comes from the "
+            "scene model itself"
+        )
 
 
 def resolve_scene_default_qpos(cfg: SceneCfg, backend: SimBackend) -> np.ndarray | None:
