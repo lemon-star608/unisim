@@ -1033,7 +1033,7 @@ class SimBackend(abc.ABC):
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
         """Return supported domain-randomization capabilities for this backend."""
 
-    def get_fixed_variant_metadata(self, entity: str) -> FixedVariantMetadata:
+    def get_entity_variant_metadata(self, entity: str) -> FixedVariantMetadata:
         """Return backend-authoritative metadata for one entity's variant pool.
 
         ``mass`` is the per-environment ``(num_envs,)`` measured mass of the

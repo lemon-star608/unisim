@@ -1794,7 +1794,7 @@ class MjcfSubprocessBackend(SimBackend):
             )
         return DomainRandomizationCapabilities(**fields)
 
-    def get_fixed_variant_metadata(self, entity: str) -> FixedVariantMetadata:
+    def get_entity_variant_metadata(self, entity: str) -> FixedVariantMetadata:
         """Expand the worker-measured variant masses per environment.
 
         The worker measures every pool variant's mass from the baked USD at

@@ -14,7 +14,7 @@ presence declares fixed variants under ``SAME_LAYOUT`` while no-pool scenes
 keep the pre-migration (baseline) declaration field for field.
 
 The M1.3 section covers the public mass readback
-``get_fixed_variant_metadata``: the fake INIT metadata carries the
+``get_entity_variant_metadata``: the fake INIT metadata carries the
 worker-measured ``variant_assignment.masses`` table and the host expands it
 per environment with the pool assignment (the real worker measurement reads
 ``UsdPhysics.MassAPI`` from the baked variant USDs and is verified by the
@@ -475,7 +475,7 @@ def test_capabilities_pool_survives_without_rigid_roots(variant_files, robot_fil
 
 
 # ---------------------------------------------------------------------------
-# Mass readback publicization (SimToolReal M1.3): get_fixed_variant_metadata
+# Mass readback publicization (SimToolReal M1.3): get_entity_variant_metadata
 # ---------------------------------------------------------------------------
 
 def test_metadata_expands_measured_masses_per_env(variant_files, robot_file, monkeypatch):
@@ -488,7 +488,7 @@ def test_metadata_expands_measured_masses_per_env(variant_files, robot_file, mon
         init_meta=_masses_meta((0.2, 0.3, 0.5)),
     )
     try:
-        metadata = backend.get_fixed_variant_metadata("object")
+        metadata = backend.get_entity_variant_metadata("object")
         assert isinstance(metadata, FixedVariantMetadata)
         np.testing.assert_allclose(metadata.mass, [0.2, 0.3, 0.5, 0.2])
         assert metadata.mass.shape == (NUM_ENVS,)
@@ -516,7 +516,7 @@ def test_metadata_lazily_materializes_the_pool(variant_files, robot_file, monkey
     )
     try:
         assert backend._worker_init_meta is None
-        metadata = backend.get_fixed_variant_metadata("object")
+        metadata = backend.get_entity_variant_metadata("object")
         np.testing.assert_allclose(metadata.mass, [0.2, 0.3, 0.5, 0.2])
         assert backend._worker_init_meta is not None
     finally:
@@ -532,7 +532,7 @@ def test_metadata_without_pool_fails_closed(variant_files, robot_file, monkeypat
     )
     try:
         with pytest.raises(NotImplementedError, match="no fixed variant pool"):
-            backend.get_fixed_variant_metadata("object")
+            backend.get_entity_variant_metadata("object")
     finally:
         backend.close()
 
@@ -547,7 +547,7 @@ def test_metadata_wrong_entity_fails_closed(variant_files, robot_file, monkeypat
     )
     try:
         with pytest.raises(ValueError, match=r"'goalviz'.*'object'"):
-            backend.get_fixed_variant_metadata("goalviz")
+            backend.get_entity_variant_metadata("goalviz")
     finally:
         backend.close()
 
@@ -571,12 +571,12 @@ def test_metadata_missing_worker_masses_fails_closed(
     )
     try:
         with pytest.raises(RuntimeError, match="did not report measured variant masses"):
-            backend.get_fixed_variant_metadata("object")
+            backend.get_entity_variant_metadata("object")
     finally:
         backend.close()
 
 
-def test_base_get_fixed_variant_metadata_default_fails_closed():
+def test_base_get_entity_variant_metadata_default_fails_closed():
     # The family-wide SimBackend default stays fail-closed; only pooled
     # subprocess scenes override it.  The dynamic stub neutralizes the
     # abstract surface (and __init__) so the inherited default body runs.
@@ -592,7 +592,7 @@ def test_base_get_fixed_variant_metadata_default_fails_closed():
         },
     )
     with pytest.raises(NotImplementedError, match="does not expose fixed variant metadata"):
-        stub().get_fixed_variant_metadata("object")
+        stub().get_entity_variant_metadata("object")
 
 
 # ---------------------------------------------------------------------------
