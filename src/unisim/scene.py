@@ -611,26 +611,35 @@ def validate_scene_composition_support(
     default behavior.  Each adapter declares what it consumes; the subprocess
     family routes the flags through the ``_supports_*`` hooks so pooled
     specializations own their declaration.
+
+    The fields are read defensively: a duck-typed scene stand-in without them
+    (dependency-probe tests construct backends with bare objects to reach the
+    backend's own missing-runtime error) carries no declarations, so the gate
+    passes through; real ``SceneCfg`` instances always define the fields.
     """
-    if scene.entity_assets and not supports_entity_assets:
+    entity_assets = getattr(scene, "entity_assets", None)
+    ground_plane = getattr(scene, "ground_plane", None)
+    scene_physx = getattr(scene, "physx", None)
+    env_grid_spacing = getattr(scene, "env_grid_spacing", None)
+    if entity_assets and not supports_entity_assets:
         raise NotImplementedError(
             f"{backend_label} backend does not consume multi-asset scene composition "
             "(SceneCfg.entity_assets); select a backend that materializes "
             "declared entity assets"
         )
-    if scene.ground_plane is not None and not supports_ground_plane:
+    if ground_plane is not None and not supports_ground_plane:
         raise NotImplementedError(
             f"{backend_label} backend does not consume the declarative ground plane "
             "(SceneCfg.ground_plane); this backend's scene floor comes from the "
             "scene model itself"
         )
-    if scene.physx is not None and not supports_scene_physx:
+    if scene_physx is not None and not supports_scene_physx:
         raise NotImplementedError(
             f"{backend_label} backend does not consume the scene-level PhysX "
             "declaration (SceneCfg.physx); this backend's solver configuration "
             "comes from the scene model itself"
         )
-    if scene.env_grid_spacing is not None and not supports_env_grid_spacing:
+    if env_grid_spacing is not None and not supports_env_grid_spacing:
         raise NotImplementedError(
             f"{backend_label} backend does not consume the environment grid "
             "spacing declaration (SceneCfg.env_grid_spacing); this backend owns "
