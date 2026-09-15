@@ -12,6 +12,13 @@ tests assert on assembled transactions.
 The M1.2 section covers the matching ``get_dr_capabilities`` report: pool
 presence declares fixed variants under ``SAME_LAYOUT`` while no-pool scenes
 keep the pre-migration (baseline) declaration field for field.
+
+The M1.3 section covers the public mass readback
+``get_fixed_variant_metadata``: the fake INIT metadata carries the
+worker-measured ``variant_assignment.masses`` table and the host expands it
+per environment with the pool assignment (the real worker measurement reads
+``UsdPhysics.MassAPI`` from the baked variant USDs and is verified by the
+M3 Kit probe).
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from unisim.backend.base import SimBackend
 from unisim.backend.subprocess_ipc import protocol
 from unisim.backend.subprocess_ipc.backend import (
     MjcfSubprocessBackend,
@@ -34,6 +42,7 @@ from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQ
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
     FixedVariantLayout,
+    FixedVariantMetadata,
     FixedVariantPlan,
     ModelSourceDescriptor,
 )
@@ -118,6 +127,21 @@ def _worker_meta():
     }
 
 
+def _masses_meta(masses=(0.2, 0.3, 0.5), *, with_masses=True, with_assignment=True):
+    """Fake INIT meta carrying the worker's measured variant mass table."""
+    meta = _worker_meta()
+    if with_assignment:
+        assignment = {
+            "target_entity": "object",
+            "expected": [0, 1, 2, 0],
+            "observed": [0, 1, 2, 0],
+        }
+        if with_masses:
+            assignment["masses"] = [float(value) for value in masses]
+        meta["variant_assignment"] = assignment
+    return meta
+
+
 class _FakeWorkerProcess:
     """Pipe-bearing ``Popen`` stand-in so materialize() spawns no real worker."""
 
@@ -144,8 +168,11 @@ class _FakeWorkerProcess:
 class _FakeWorkerBackend(MjcfSubprocessBackend):
     """Record every worker request and answer the INIT/ATTACH handshake."""
 
-    def __init__(self, scene: SceneCfg, num_envs: int = NUM_ENVS):
+    def __init__(
+        self, scene: SceneCfg, num_envs: int = NUM_ENVS, init_meta: dict | None = None
+    ):
         self.requests: list[tuple[str, dict]] = []
+        self._fake_init_meta = _worker_meta() if init_meta is None else init_meta
         super().__init__(scene, num_envs=num_envs, sim_dt=0.01)
 
     def _worker_entrypoint(self) -> Path:
@@ -162,22 +189,26 @@ class _FakeWorkerBackend(MjcfSubprocessBackend):
         del expect
         self.requests.append((cmd, payload))
         if cmd == protocol.CMD_INIT:
-            return _worker_meta()
+            return dict(self._fake_init_meta)
         return {}
 
 
-def _backend(robot_file, specs, plan, *, num_envs: int = NUM_ENVS) -> _FakeWorkerBackend:
+def _backend(
+    robot_file, specs, plan, *, num_envs: int = NUM_ENVS, init_meta: dict | None = None
+) -> _FakeWorkerBackend:
     scene = SceneCfg(
         model_file=str(robot_file), entity_assets=tuple(specs), fixed_variant_plan=plan
     )
-    return _FakeWorkerBackend(scene, num_envs=num_envs)
+    return _FakeWorkerBackend(scene, num_envs=num_envs, init_meta=init_meta)
 
 
-def _materialized(robot_file, specs, plan, monkeypatch, *, num_envs: int = NUM_ENVS):
+def _materialized(
+    robot_file, specs, plan, monkeypatch, *, num_envs: int = NUM_ENVS, init_meta=None
+):
     # Patch the stdlib module attribute the shared adapter calls; scoped to
     # this test by the monkeypatch fixture.
     monkeypatch.setattr(subprocess, "Popen", _FakeWorkerProcess)
-    backend = _backend(robot_file, specs, plan, num_envs=num_envs)
+    backend = _backend(robot_file, specs, plan, num_envs=num_envs, init_meta=init_meta)
     backend.materialize()
     return backend
 
@@ -441,3 +472,156 @@ def test_capabilities_pool_survives_without_rigid_roots(variant_files, robot_fil
         assert capabilities.supported_interval_terms == frozenset()
     finally:
         backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Mass readback publicization (SimToolReal M1.3): get_fixed_variant_metadata
+# ---------------------------------------------------------------------------
+
+def test_metadata_expands_measured_masses_per_env(variant_files, robot_file, monkeypatch):
+    # 3 variants measured at [0.2, 0.3, 0.5] x assignment [0, 1, 2, 0].
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+        init_meta=_masses_meta((0.2, 0.3, 0.5)),
+    )
+    try:
+        metadata = backend.get_fixed_variant_metadata("object")
+        assert isinstance(metadata, FixedVariantMetadata)
+        np.testing.assert_allclose(metadata.mass, [0.2, 0.3, 0.5, 0.2])
+        assert metadata.mass.shape == (NUM_ENVS,)
+        assert metadata.mass.dtype == np.float64
+        assert metadata.mass.flags.writeable is False
+        # The diagnostic list is exactly the pool payload's source files.
+        assert metadata.variant_files == tuple(str(path.resolve()) for path in variant_files)
+        assert metadata.variant_files == tuple(backend._init_variant_pool["source_files"])
+        # The narrowed scope: no assignment/scale fields on the public type.
+        assert not hasattr(metadata, "assignment")
+        assert not hasattr(metadata, "scale")
+    finally:
+        backend.close()
+
+
+def test_metadata_lazily_materializes_the_pool(variant_files, robot_file, monkeypatch):
+    # The _require_materialized() guard reuse: a never-materialized pooled
+    # backend materializes on first query instead of raising.
+    monkeypatch.setattr(subprocess, "Popen", _FakeWorkerProcess)
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0]),
+        init_meta=_masses_meta((0.2, 0.3, 0.5)),
+    )
+    try:
+        assert backend._worker_init_meta is None
+        metadata = backend.get_fixed_variant_metadata("object")
+        np.testing.assert_allclose(metadata.mass, [0.2, 0.3, 0.5, 0.2])
+        assert backend._worker_init_meta is not None
+    finally:
+        backend.close()
+
+
+def test_metadata_without_pool_fails_closed(variant_files, robot_file, monkeypatch):
+    monkeypatch.setattr(subprocess, "Popen", _FakeWorkerProcess)
+    backend = _backend(
+        robot_file,
+        [_object_spec(str(variant_files[0]), consumes_fixed_variant_pool=False)],
+        None,
+    )
+    try:
+        with pytest.raises(NotImplementedError, match="no fixed variant pool"):
+            backend.get_fixed_variant_metadata("object")
+    finally:
+        backend.close()
+
+
+def test_metadata_wrong_entity_fails_closed(variant_files, robot_file, monkeypatch):
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+        init_meta=_masses_meta((0.2, 0.3, 0.5)),
+    )
+    try:
+        with pytest.raises(ValueError, match=r"'goalviz'.*'object'"):
+            backend.get_fixed_variant_metadata("goalviz")
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "meta_factory",
+    [
+        pytest.param(lambda: _masses_meta(with_masses=False), id="assignment_without_masses"),
+        pytest.param(lambda: _masses_meta(with_assignment=False), id="assignment_absent"),
+    ],
+)
+def test_metadata_missing_worker_masses_fails_closed(
+    variant_files, robot_file, monkeypatch, meta_factory
+):
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]))],
+        _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+        init_meta=meta_factory(),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not report measured variant masses"):
+            backend.get_fixed_variant_metadata("object")
+    finally:
+        backend.close()
+
+
+def test_base_get_fixed_variant_metadata_default_fails_closed():
+    # The family-wide SimBackend default stays fail-closed; only pooled
+    # subprocess scenes override it.  The dynamic stub neutralizes the
+    # abstract surface (and __init__) so the inherited default body runs.
+    stub = type(
+        "_NoVariantBackend",
+        (SimBackend,),
+        {
+            "__init__": lambda self: None,
+            **{
+                name: lambda self, *args, **kwargs: None
+                for name in SimBackend.__abstractmethods__
+            },
+        },
+    )
+    with pytest.raises(NotImplementedError, match="does not expose fixed variant metadata"):
+        stub().get_fixed_variant_metadata("object")
+
+
+# ---------------------------------------------------------------------------
+# FixedVariantMetadata container contract (pure dataclass validation)
+# ---------------------------------------------------------------------------
+
+def test_fixed_variant_metadata_freezes_mass_read_only():
+    metadata = FixedVariantMetadata(mass=np.asarray([0.2, 0.3]), variant_files=("a.urdf",))
+    assert metadata.mass.dtype == np.float64
+    assert metadata.mass.flags.writeable is False
+    # Integer input is normalized to the float64 array convention.
+    integer = FixedVariantMetadata(mass=np.asarray([1, 2]), variant_files=("a.urdf",))
+    assert integer.mass.dtype == np.float64
+    np.testing.assert_allclose(integer.mass, [1.0, 2.0])
+
+
+def test_fixed_variant_metadata_post_init_rejects_bad_shapes():
+    with pytest.raises(ValueError, match=r"\(num_envs,\)"):
+        FixedVariantMetadata(mass=np.zeros((2, 2)), variant_files=("a.urdf",))
+    with pytest.raises(ValueError, match=r"\(num_envs,\)"):
+        FixedVariantMetadata(mass=np.zeros(0), variant_files=("a.urdf",))
+    with pytest.raises(ValueError, match="finite"):
+        FixedVariantMetadata(mass=np.asarray([np.nan]), variant_files=("a.urdf",))
+    with pytest.raises(ValueError, match="finite"):
+        FixedVariantMetadata(mass=np.asarray([np.inf]), variant_files=("a.urdf",))
+
+
+def test_fixed_variant_metadata_post_init_rejects_bad_variant_files():
+    with pytest.raises(TypeError, match="tuple"):
+        FixedVariantMetadata(mass=np.ones(2), variant_files=["a.urdf"])
+    with pytest.raises(TypeError, match="non-empty strings"):
+        FixedVariantMetadata(mass=np.ones(2), variant_files=("",))

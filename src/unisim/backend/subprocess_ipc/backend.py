@@ -43,6 +43,7 @@ from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQ
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
     FixedVariantLayout,
+    FixedVariantMetadata,
     FixedVariantPlan,
     IntervalRandomizationPlan,
     ResetRandomizationPayload,
@@ -1760,6 +1761,48 @@ class MjcfSubprocessBackend(SimBackend):
                 supported_fixed_variant_layouts=frozenset({FixedVariantLayout.SAME_LAYOUT}),
             )
         return DomainRandomizationCapabilities(**fields)
+
+    def get_fixed_variant_metadata(self, entity: str) -> FixedVariantMetadata:
+        """Expand the worker-measured variant masses per environment.
+
+        The worker measures every pool variant's mass from the baked USD at
+        INIT and reports the table through the INIT metadata
+        (backend-authoritative measurement, interface-migration.md ruling 9);
+        this readback expands it to ``(num_envs,)`` with the pool assignment
+        already validated at payload assembly.  Every direction fails
+        closed: no pool, an entity the pool is not bound to, or missing
+        worker measurements raise instead of returning defaults.
+        """
+        if self._scene.fixed_variant_plan is None:
+            raise NotImplementedError(
+                f"{self._BACKEND_LABEL} scene carries no fixed variant pool"
+            )
+        self._require_materialized()
+        pool = self._init_variant_pool
+        assert pool is not None  # materialize() assembles it from the plan
+        meta = self._worker_init_meta
+        assert meta is not None  # set together with _model_info by materialize()
+        if entity != pool["target_entity"]:
+            raise ValueError(
+                f"{self._BACKEND_LABEL} fixed variant metadata requested for entity "
+                f"{entity!r} but the pool targets {pool['target_entity']!r}"
+            )
+        assignment_meta = meta.get("variant_assignment")
+        masses = None if assignment_meta is None else assignment_meta.get("masses")
+        if masses is None:
+            raise RuntimeError(
+                f"{self._BACKEND_LABEL} worker did not report measured variant masses"
+            )
+        measured = np.asarray([float(value) for value in masses], dtype=np.float64)
+        if measured.size != len(pool["source_files"]):
+            raise RuntimeError(
+                f"{self._BACKEND_LABEL} worker reported {measured.size} measured variant "
+                f"masses for {len(pool['source_files'])} pool sources"
+            )
+        return FixedVariantMetadata(
+            mass=measured[np.asarray(pool["assignments"], dtype=np.intp)],
+            variant_files=tuple(pool["source_files"]),
+        )
 
     def _stage_body_wrench(
         self,
