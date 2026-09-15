@@ -8,6 +8,10 @@ single cold-path validation point and assembles the worker INIT
 run against a fake worker (no process is spawned); the INIT payload is
 read back from the captured request stream the same way the sibling IPC
 tests assert on assembled transactions.
+
+The M1.2 section covers the matching ``get_dr_capabilities`` report: pool
+presence declares fixed variants under ``SAME_LAYOUT`` while no-pool scenes
+keep the pre-migration (baseline) declaration field for field.
 """
 
 from __future__ import annotations
@@ -26,7 +30,13 @@ from unisim.backend.subprocess_ipc.backend import (
     MjcfSubprocessBackend,
     build_init_variant_pool_payload,
 )
-from unisim.dr.types import FixedVariantPlan, ModelSourceDescriptor
+from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
+from unisim.dr.types import (
+    DomainRandomizationCapabilities,
+    FixedVariantLayout,
+    FixedVariantPlan,
+    ModelSourceDescriptor,
+)
 from unisim.scene import SceneCfg, SceneEntitySpec
 
 ROBOT_URDF = """<?xml version="1.0"?>
@@ -343,3 +353,91 @@ def test_source_files_resolve_relative_and_home_paths(tmp_path, monkeypatch):
         ],
         "assignments": [0, 0],
     }
+
+
+# ---------------------------------------------------------------------------
+# DR capability report (SimToolReal M1.2): pool presence drives the report
+# ---------------------------------------------------------------------------
+
+_BASELINE_INTERVAL_CAPABILITIES = DomainRandomizationCapabilities(
+    supports_interval_body_force=True,
+    supports_interval_body_torque=True,
+    supported_interval_terms=frozenset({INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}),
+)
+
+
+def test_capabilities_no_pool_no_rigid_roots_are_defaults(robot_file):
+    backend = _backend(robot_file, [], None)
+    try:
+        assert backend._rigid_root_entities == ()
+        assert backend.get_dr_capabilities() == DomainRandomizationCapabilities()
+    finally:
+        backend.close()
+
+
+def test_capabilities_no_pool_match_baseline(variant_files, robot_file, monkeypatch):
+    backend = _materialized(
+        robot_file,
+        [_object_spec(str(variant_files[0]), consumes_fixed_variant_pool=False)],
+        None,
+        monkeypatch,
+    )
+    try:
+        assert backend._rigid_root_entities == ("object",)
+        capabilities = backend.get_dr_capabilities()
+        # Acceptance anchor: without a pool the declaration is field-for-field
+        # the pre-migration baseline.
+        assert capabilities == _BASELINE_INTERVAL_CAPABILITIES
+        # The deferred fixed-variant contract stays fully off without a pool.
+        assert capabilities.supports_fixed_variants is False
+        assert capabilities.supported_fixed_variant_layouts == frozenset()
+        assert capabilities.supports_per_env_playback is False
+    finally:
+        backend.close()
+
+
+def test_capabilities_pooled_scene_declares_fixed_variants(variant_files, robot_file, monkeypatch):
+    backend = _materialized(
+        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2, 0]),
+        monkeypatch,
+    )
+    try:
+        capabilities = backend.get_dr_capabilities()
+        assert capabilities.supports_fixed_variants is True
+        assert capabilities.supported_fixed_variant_layouts == frozenset(
+            {FixedVariantLayout.SAME_LAYOUT}
+        )
+        assert capabilities.supports_per_env_playback is False
+        layouts = capabilities.supported_fixed_variant_layouts
+        assert FixedVariantLayout.UNIFORM_PUBLIC_LAYOUT not in layouts
+        # The pool declaration merges with (not replaces) the interval one.
+        assert capabilities.supports_interval_body_force is True
+        assert capabilities.supports_interval_body_torque is True
+        assert capabilities.supported_interval_terms == frozenset(
+            {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
+        )
+    finally:
+        backend.close()
+
+
+def test_capabilities_pool_survives_without_rigid_roots(variant_files, robot_file):
+    # Capability reports are queried before materialize() (factory guard);
+    # the pool declaration must survive the legacy no-rigid-roots early
+    # return, which used to swallow it.
+    backend = _backend(
+        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2, 0])
+    )
+    try:
+        assert backend._rigid_root_entities == ()
+        capabilities = backend.get_dr_capabilities()
+        assert capabilities.supports_fixed_variants is True
+        assert capabilities.supported_fixed_variant_layouts == frozenset(
+            {FixedVariantLayout.SAME_LAYOUT}
+        )
+        assert capabilities.supports_per_env_playback is False
+        # Interval wrench support stays strictly rigid-root-gated.
+        assert capabilities.supports_interval_body_force is False
+        assert capabilities.supports_interval_body_torque is False
+        assert capabilities.supported_interval_terms == frozenset()
+    finally:
+        backend.close()

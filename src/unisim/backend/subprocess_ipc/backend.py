@@ -42,6 +42,7 @@ from unisim.backend.base import (
 from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
+    FixedVariantLayout,
     FixedVariantPlan,
     IntervalRandomizationPlan,
     ResetRandomizationPayload,
@@ -1732,16 +1733,33 @@ class MjcfSubprocessBackend(SimBackend):
         return {"timing": timing}
 
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
-        """Advertise interval wrench support for declared rigid entities."""
-        if not self._rigid_root_entities:
+        """Advertise interval wrench support for declared rigid entities.
+
+        Scenes carrying a ``fixed_variant_plan`` (the variant-pool channel
+        staged by :meth:`materialize`) additionally declare fixed-variant
+        support under the ``SAME_LAYOUT`` guarantee, whether or not rigid
+        root entities are bound yet.  ``supports_per_env_playback`` and
+        ``UNIFORM_PUBLIC_LAYOUT`` stay undeclared: the family's playback
+        semantics and public-layout guarantee are deliberate deferrals.
+        """
+        pooled = self._scene.fixed_variant_plan is not None
+        if not self._rigid_root_entities and not pooled:
             return DomainRandomizationCapabilities()
-        return DomainRandomizationCapabilities(
-            supports_interval_body_force=True,
-            supports_interval_body_torque=True,
-            supported_interval_terms=frozenset(
-                {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
-            ),
-        )
+        fields: dict[str, Any] = {}
+        if self._rigid_root_entities:
+            fields.update(
+                supports_interval_body_force=True,
+                supports_interval_body_torque=True,
+                supported_interval_terms=frozenset(
+                    {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
+                ),
+            )
+        if pooled:
+            fields.update(
+                supports_fixed_variants=True,
+                supported_fixed_variant_layouts=frozenset({FixedVariantLayout.SAME_LAYOUT}),
+            )
+        return DomainRandomizationCapabilities(**fields)
 
     def _stage_body_wrench(
         self,
