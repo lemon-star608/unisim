@@ -43,7 +43,6 @@ from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQ
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
     FixedVariantPlan,
-    InitRandomizationPlan,
     IntervalRandomizationPlan,
     ResetRandomizationPayload,
 )
@@ -288,9 +287,6 @@ class MjcfSubprocessBackend(SimBackend):
     _BACKEND_LABEL = "subprocess"
     _WORKER_ERROR_CLS: type[SubprocessWorkerError] = SubprocessWorkerError
     _MODEL_INFO_CLS: type[SubprocessModelInfo] = SubprocessModelInfo
-    # Workers that materialize whole-file model variant pools at INIT opt in
-    # here; the rest fail closed on non-empty InitRandomizationPlans.
-    _SUPPORTS_INIT_MODEL_VARIANTS = False
 
     def _worker_error(self, message: str, **kwargs: Any) -> SubprocessWorkerError:
         """Construct the concrete adapter's public worker error type."""
@@ -1090,40 +1086,6 @@ class MjcfSubprocessBackend(SimBackend):
         if self._init_variant_pool is None:
             return {}
         return {"variant_pool": dict(self._init_variant_pool)}
-
-    def apply_init_randomization(self, plan: InitRandomizationPlan) -> None:
-        """Validate and stage a whole-file model-variant pool for INIT.
-
-        The pool is serialized into the INIT payload, so it must be applied
-        before materialization; the worker converts each source URDF once and
-        pins the per-env assignment for the worker's lifetime (reset never
-        recompiles or reassigns).  Validation lives in
-        :func:`build_init_variant_pool_payload` and fails closed on
-        unsupported variant kinds, undeclared targets, and out-of-range
-        assignments.
-        """
-        if plan.is_empty():
-            return
-        if not self._SUPPORTS_INIT_MODEL_VARIANTS:
-            raise NotImplementedError(
-                f"{self._BACKEND_LABEL} does not support init-lifecycle model variants"
-            )
-        if self._proc is not None:
-            raise RuntimeError(
-                f"{self._BACKEND_LABEL} init randomization must run before worker "
-                "materialization; the variant pool is fixed at INIT"
-            )
-        if self._init_variant_pool is not None:
-            raise RuntimeError(
-                f"{self._BACKEND_LABEL} init randomization was already applied; "
-                "variant assignments are immutable for one worker lifetime"
-            )
-        self._init_variant_pool = build_init_variant_pool_payload(
-            plan,
-            num_envs=self._num_envs,
-            entity_assets=tuple(self._scene.entity_assets),
-            backend_label=self._BACKEND_LABEL,
-        )
 
     def _validate_xml_metadata_against_worker(self) -> None:
         """Fail closed when the MJCF importer changed names or ordering.
