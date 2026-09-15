@@ -18,6 +18,7 @@ from unisim.backend.subprocess_ipc.backend import (
     SubprocessModelInfo,
     SubprocessWorkerError,
 )
+from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
 from unisim.dr.types import IntervalRandomizationPlan
 from unisim.scene import SceneCfg, SceneEntitySpec
 
@@ -246,6 +247,49 @@ def test_multi_asset_interval_wrench_stages_only_rigid_root_rows(multi_asset_bac
                 body_force=force,
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Interval wrench staging (handler table + public apply_body_force)
+# ---------------------------------------------------------------------------
+
+def test_interval_term_handlers_table_is_cached(multi_asset_backend):
+    backend = multi_asset_backend
+    table = backend._interval_term_handlers()
+    assert set(table) == {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
+    # The table is built once on the cold path and never rebuilt per plan.
+    assert backend._interval_term_handlers() is table
+
+
+def test_apply_body_force_stages_dense_slots_directly(multi_asset_backend):
+    backend = multi_asset_backend
+    force = np.full((NUM_ENVS, 1, 3), 3.0, dtype=np.float32)
+    torque = np.full((NUM_ENVS, 1, 3), -1.5, dtype=np.float32)
+    backend.apply_body_force(np.asarray([NUM_BODIES], dtype=np.int32), force, torque)
+    np.testing.assert_array_equal(
+        backend._slots[protocol.WRENCH_FORCE_SLOT][:, NUM_BODIES, :], force[:, 0, :]
+    )
+    np.testing.assert_array_equal(
+        backend._slots[protocol.WRENCH_TORQUE_SLOT][:, NUM_BODIES, :], torque[:, 0, :]
+    )
+    # The public staging entry accumulates within the control step like the
+    # plan path.
+    backend.apply_body_force(np.asarray([NUM_BODIES], dtype=np.int32), force)
+    np.testing.assert_array_equal(
+        backend._slots[protocol.WRENCH_FORCE_SLOT][:, NUM_BODIES, :], 2.0 * force[:, 0, :]
+    )
+
+
+def test_apply_body_force_torque_none_leaves_torque_slot_untouched(multi_asset_backend):
+    backend = multi_asset_backend
+    backend._slots[protocol.WRENCH_TORQUE_SLOT][:] = 7.0
+    force = np.full((NUM_ENVS, 1, 3), 1.25, dtype=np.float32)
+    backend.apply_body_force(np.asarray([NUM_BODIES + 2], dtype=np.int32), force)
+    np.testing.assert_array_equal(
+        backend._slots[protocol.WRENCH_FORCE_SLOT][:, NUM_BODIES + 2, :], force[:, 0, :]
+    )
+    # torque=None writes only the force channel (base docstring semantics).
+    np.testing.assert_array_equal(backend._slots[protocol.WRENCH_TORQUE_SLOT], 7.0)
 
 
 # ---------------------------------------------------------------------------
