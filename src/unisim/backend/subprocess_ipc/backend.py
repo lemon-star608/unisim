@@ -424,9 +424,9 @@ class MjcfSubprocessBackend(SimBackend):
         self._collision_filtering_applied = False
         self._scene_metadata: SceneMetadata | None = None
         self._entity_metadata: dict[str, SceneMetadata] | None = None
-        # Variant pool assembled from the scene's fixed_variant_plan by
-        # materialize() (the single cold-path validation point); ``None``
-        # keeps the legacy INIT payload unchanged.
+        # Variant pool staged by the adapter that owns the entity-bound pool
+        # realization (IsaacSimBackend.materialize); ``None`` keeps the INIT
+        # payload without the ``variant_pool`` key.
         self._init_variant_pool: dict[str, Any] | None = None
         self._initial_qpos: np.ndarray | None = None
         self._initial_qpos_resolved = False
@@ -469,39 +469,13 @@ class MjcfSubprocessBackend(SimBackend):
         Idempotent. Called lazily by the first state/metadata access, so env
         constructors that read shapes before the explicit lifecycle point work
         like they do on the MuJoCo backend. A closed backend cannot be
-        materialized again.  The scene's fixed variant plan is validated and
-        staged into the INIT payload here, before any worker process is
-        spawned.
+        materialized again.
         """
         if self._proc is not None:
             return
         if self._closed:
             raise self._worker_error(
                 f"{self._BACKEND_LABEL} backend is closed and cannot be materialized again"
-            )
-        # Single cold-path validation point for the fixed-variant channel
-        # (scene plan x per-entity binding).  Every direction fails closed
-        # here, before any worker process is spawned: a plan without exactly
-        # one declared consumer, a consumer without a plan, or a consumer
-        # whose entity shape cannot host a variant pool.
-        plan = self._scene.fixed_variant_plan
-        declared = [
-            spec for spec in self._scene.entity_assets if spec.consumes_fixed_variant_pool
-        ]
-        if plan is None:
-            if declared:
-                names = sorted(spec.name for spec in declared)
-                raise ValueError(
-                    f"{self._BACKEND_LABEL} scene entities {names} declare "
-                    "consumes_fixed_variant_pool=True but the scene carries no "
-                    "fixed_variant_plan; refusing to materialize a partial variant channel"
-                )
-        else:
-            self._init_variant_pool = build_init_variant_pool_payload(
-                plan,
-                num_envs=self._num_envs,
-                entity_assets=tuple(self._scene.entity_assets),
-                backend_label=self._BACKEND_LABEL,
             )
         # Parent-side MJCF metadata (sensors, keyframes, joint document order)
         # is resolved lazily on first access and reused here so the INIT
@@ -1794,7 +1768,7 @@ class MjcfSubprocessBackend(SimBackend):
             )
         return DomainRandomizationCapabilities(**fields)
 
-    def get_fixed_variant_metadata(self, entity: str) -> FixedVariantMetadata:
+    def get_entity_variant_metadata(self, entity: str) -> FixedVariantMetadata:
         """Expand the worker-measured variant masses per environment.
 
         The worker measures every pool variant's mass from the baked USD at
