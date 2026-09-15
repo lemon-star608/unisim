@@ -42,7 +42,9 @@ from unisim.backend.base import (
 from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
-    InitRandomizationPlan,
+    FixedVariantLayout,
+    FixedVariantMetadata,
+    FixedVariantPlan,
     IntervalRandomizationPlan,
     ResetRandomizationPayload,
 )
@@ -95,80 +97,42 @@ _UNLIMITED_DOF_EFFORT = 1e20
 
 
 def build_init_variant_pool_payload(
-    plan: InitRandomizationPlan,
+    variant_plan: FixedVariantPlan,
     *,
     num_envs: int,
     entity_assets: tuple[SceneEntitySpec, ...],
     backend_label: str,
 ) -> dict[str, Any]:
-    """Validate an init-randomization plan into a worker INIT payload entry.
+    """Validate a fixed variant plan into a worker INIT payload entry.
 
-    Pure cold-path validation shared by every subprocess backend that supports
-    whole-file model variants (SimToolReal step 1.3).  One plan maps to one
-    ``MultiUsdFileCfg``-style pool on the worker, so all variants must target
-    the same declared scene entity; that entity must be a floating rigid
-    object whose declared format matches the variant files.  Every check
-    fails closed: geom-only variants, non-URDF sources, undeclared targets,
-    missing files, and malformed assignments are all rejected before any
-    worker is spawned.
+    Pure cold-path validation shared by every subprocess backend that
+    materializes whole-file model variant pools (SimToolReal M1.1).  The
+    plan's per-environment assignment maps to one ``MultiUsdFileCfg``-style
+    pool on the worker, so exactly one declared scene entity must bind
+    itself to the pool with ``consumes_fixed_variant_pool=True``; that
+    entity must be a floating rigid object whose declared format matches
+    the variant files.  Every check fails closed: undeclared or ambiguous
+    targets, non-URDF sources, missing files, and malformed assignments are
+    all rejected before any worker is spawned.  The payload never carries a
+    ``masses`` key: variant mass is backend-authoritative (read back from
+    the materialized asset), and owner-side measurement flows through the
+    worker probe in M1.3.
     """
-    variants = tuple(plan.model_variants)
-    if not variants:
-        raise ValueError(f"{backend_label} init variant pool requires at least one variant")
-    targets: set[str] = set()
-    source_files: list[str] = []
-    masses: list[float] = []
-    has_mass = False
-    for index, variant in enumerate(variants):
-        if variant.source_model_file is None:
-            raise NotImplementedError(
-                f"{backend_label} supports whole-file model variants only; variant {index} "
-                "carries geom_size_overrides, which require an in-process compiler"
-            )
-        if variant.source_format != MODEL_FORMAT_URDF:
-            raise NotImplementedError(
-                f"{backend_label} whole-file variants must be URDF; variant {index} has "
-                f"source_format={variant.source_format!r}"
-            )
-        if variant.target_entity is None:
-            raise ValueError(
-                f"{backend_label} whole-file variant {index} must declare target_entity; "
-                "replacing the primary scene model per env is unsupported"
-            )
-        targets.add(variant.target_entity)
-        path = Path(variant.source_model_file).expanduser()
-        if not path.is_file():
-            raise ValueError(
-                f"{backend_label} variant {index} source_model_file does not exist: {path}"
-            )
-        source_files.append(str(path.resolve()))
-        if variant.mass is None:
-            if has_mass:
-                raise ValueError(
-                    f"{backend_label} init variant pool mass metadata is incomplete at "
-                    f"variant {index}"
-                )
-        else:
-            if not has_mass and masses:
-                raise ValueError(
-                    f"{backend_label} init variant pool mass metadata is incomplete at "
-                    f"variant {index}"
-                )
-            has_mass = True
-            masses.append(float(variant.mass))
-    if len(targets) != 1:
+    declared = [spec for spec in entity_assets if spec.consumes_fixed_variant_pool]
+    if not declared:
         raise ValueError(
-            f"{backend_label} init variant plans must target exactly one scene entity, "
-            f"got {sorted(targets)}; one plan maps to one worker-side asset pool"
+            f"{backend_label} fixed variant pool requires exactly one scene entity with "
+            "consumes_fixed_variant_pool=True, got 0; the plan has no target"
         )
-    target = next(iter(targets))
-    specs_by_name = {spec.name: spec for spec in entity_assets}
-    spec = specs_by_name.get(target)
-    if spec is None:
+    if len(declared) > 1:
+        names = sorted(spec.name for spec in declared)
         raise ValueError(
-            f"{backend_label} variant target_entity {target!r} is not a declared scene "
-            f"entity; declared: {sorted(specs_by_name)}"
+            f"{backend_label} fixed variant pool requires exactly one scene entity with "
+            f"consumes_fixed_variant_pool=True, got {len(declared)}: {names}; one pool maps "
+            "to one worker-side asset pool"
         )
+    spec = declared[0]
+    target = spec.name
     if spec.materialization != ENTITY_MATERIALIZATION_RIGID:
         raise NotImplementedError(
             f"{backend_label} variant target {target!r} has materialization "
@@ -185,36 +149,26 @@ def build_init_variant_pool_payload(
             f"{spec.asset_format!r}, which does not match the URDF variant files"
         )
 
-    raw_assignments = np.asarray(plan.model_assignments)
-    if raw_assignments.dtype == bool or not np.issubdtype(raw_assignments.dtype, np.integer):
-        raise ValueError(
-            f"{backend_label} model_assignments must have an integer dtype, "
-            f"got {raw_assignments.dtype}"
-        )
-    assignments = raw_assignments.astype(np.int64, copy=False)
-    if assignments.shape != (int(num_envs),):
-        raise ValueError(
-            f"{backend_label} model_assignments must have shape ({int(num_envs)},), "
-            f"got {raw_assignments.shape}"
-        )
-    if np.any(assignments < 0) or np.any(assignments >= len(variants)):
-        raise ValueError(
-            f"{backend_label} model_assignments must be in [0, {len(variants)}), "
-            f"got min={int(assignments.min())}, max={int(assignments.max())}"
-        )
-    payload = {
+    variants = variant_plan.variants
+    if not variants:
+        # FixedVariantPlan already rejects empty catalogs; keep the explicit
+        # guard so the pool semantics cannot drift.
+        raise ValueError(f"{backend_label} init variant pool requires at least one variant")
+    source_files: list[str] = []
+    for index, variant in enumerate(variants):
+        path = Path(variant.model_file).expanduser()
+        if not path.is_file():
+            raise ValueError(
+                f"{backend_label} variant {index} source file does not exist: {path}"
+            )
+        source_files.append(str(path.resolve()))
+
+    variant_plan.validate(num_envs)
+    return {
         "target_entity": target,
         "source_files": source_files,
-        "assignments": [int(value) for value in assignments],
+        "assignments": [int(value) for value in variant_plan.assignment],
     }
-    if has_mass:
-        if len(masses) != len(variants):
-            raise ValueError(
-                f"{backend_label} init variant pool mass metadata has {len(masses)} entries; "
-                f"expected {len(variants)}"
-            )
-        payload["masses"] = masses
-    return payload
 
 
 def _display_available() -> bool:
@@ -335,9 +289,6 @@ class MjcfSubprocessBackend(SimBackend):
     _BACKEND_LABEL = "subprocess"
     _WORKER_ERROR_CLS: type[SubprocessWorkerError] = SubprocessWorkerError
     _MODEL_INFO_CLS: type[SubprocessModelInfo] = SubprocessModelInfo
-    # Workers that materialize whole-file model variant pools at INIT opt in
-    # here; the rest fail closed on non-empty InitRandomizationPlans.
-    _SUPPORTS_INIT_MODEL_VARIANTS = False
 
     def _worker_error(self, message: str, **kwargs: Any) -> SubprocessWorkerError:
         """Construct the concrete adapter's public worker error type."""
@@ -469,9 +420,9 @@ class MjcfSubprocessBackend(SimBackend):
         self._collision_filtering_applied = False
         self._scene_metadata: SceneMetadata | None = None
         self._entity_metadata: dict[str, SceneMetadata] | None = None
-        # Validated init-lifecycle variant pool, serialized into INIT.  Set by
-        # apply_init_randomization before materialization; ``None`` keeps the
-        # legacy INIT payload byte-identical.
+        # Variant pool assembled from the scene's fixed_variant_plan by
+        # materialize() (the single cold-path validation point); ``None``
+        # keeps the legacy INIT payload unchanged.
         self._init_variant_pool: dict[str, Any] | None = None
         self._initial_qpos: np.ndarray | None = None
         self._initial_qpos_resolved = False
@@ -514,13 +465,39 @@ class MjcfSubprocessBackend(SimBackend):
         Idempotent. Called lazily by the first state/metadata access, so env
         constructors that read shapes before the explicit lifecycle point work
         like they do on the MuJoCo backend. A closed backend cannot be
-        materialized again.
+        materialized again.  The scene's fixed variant plan is validated and
+        staged into the INIT payload here, before any worker process is
+        spawned.
         """
         if self._proc is not None:
             return
         if self._closed:
             raise self._worker_error(
                 f"{self._BACKEND_LABEL} backend is closed and cannot be materialized again"
+            )
+        # Single cold-path validation point for the fixed-variant channel
+        # (scene plan x per-entity binding).  Every direction fails closed
+        # here, before any worker process is spawned: a plan without exactly
+        # one declared consumer, a consumer without a plan, or a consumer
+        # whose entity shape cannot host a variant pool.
+        plan = self._scene.fixed_variant_plan
+        declared = [
+            spec for spec in self._scene.entity_assets if spec.consumes_fixed_variant_pool
+        ]
+        if plan is None:
+            if declared:
+                names = sorted(spec.name for spec in declared)
+                raise ValueError(
+                    f"{self._BACKEND_LABEL} scene entities {names} declare "
+                    "consumes_fixed_variant_pool=True but the scene carries no "
+                    "fixed_variant_plan; refusing to materialize a partial variant channel"
+                )
+        else:
+            self._init_variant_pool = build_init_variant_pool_payload(
+                plan,
+                num_envs=self._num_envs,
+                entity_assets=tuple(self._scene.entity_assets),
+                backend_label=self._BACKEND_LABEL,
             )
         # Parent-side MJCF metadata (sensors, keyframes, joint document order)
         # is resolved lazily on first access and reused here so the INIT
@@ -1111,40 +1088,6 @@ class MjcfSubprocessBackend(SimBackend):
         if self._init_variant_pool is None:
             return {}
         return {"variant_pool": dict(self._init_variant_pool)}
-
-    def apply_init_randomization(self, plan: InitRandomizationPlan) -> None:
-        """Validate and stage a whole-file model-variant pool for INIT.
-
-        The pool is serialized into the INIT payload, so it must be applied
-        before materialization; the worker converts each source URDF once and
-        pins the per-env assignment for the worker's lifetime (reset never
-        recompiles or reassigns).  Validation lives in
-        :func:`build_init_variant_pool_payload` and fails closed on
-        unsupported variant kinds, undeclared targets, and out-of-range
-        assignments.
-        """
-        if plan.is_empty():
-            return
-        if not self._SUPPORTS_INIT_MODEL_VARIANTS:
-            raise NotImplementedError(
-                f"{self._BACKEND_LABEL} does not support init-lifecycle model variants"
-            )
-        if self._proc is not None:
-            raise RuntimeError(
-                f"{self._BACKEND_LABEL} init randomization must run before worker "
-                "materialization; the variant pool is fixed at INIT"
-            )
-        if self._init_variant_pool is not None:
-            raise RuntimeError(
-                f"{self._BACKEND_LABEL} init randomization was already applied; "
-                "variant assignments are immutable for one worker lifetime"
-            )
-        self._init_variant_pool = build_init_variant_pool_payload(
-            plan,
-            num_envs=self._num_envs,
-            entity_assets=tuple(self._scene.entity_assets),
-            backend_label=self._BACKEND_LABEL,
-        )
 
     def _validate_xml_metadata_against_worker(self) -> None:
         """Fail closed when the MJCF importer changed names or ordering.
@@ -1791,15 +1734,74 @@ class MjcfSubprocessBackend(SimBackend):
         return {"timing": timing}
 
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
-        """Advertise interval wrench support for declared rigid entities."""
-        if not self._rigid_root_entities:
+        """Advertise interval wrench support for declared rigid entities.
+
+        Scenes carrying a ``fixed_variant_plan`` (the variant-pool channel
+        staged by :meth:`materialize`) additionally declare fixed-variant
+        support under the ``SAME_LAYOUT`` guarantee, whether or not rigid
+        root entities are bound yet.  ``supports_per_env_playback`` and
+        ``UNIFORM_PUBLIC_LAYOUT`` stay undeclared: the family's playback
+        semantics and public-layout guarantee are deliberate deferrals.
+        """
+        pooled = self._scene.fixed_variant_plan is not None
+        if not self._rigid_root_entities and not pooled:
             return DomainRandomizationCapabilities()
-        return DomainRandomizationCapabilities(
-            supports_interval_body_force=True,
-            supports_interval_body_torque=True,
-            supported_interval_terms=frozenset(
-                {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
-            ),
+        fields: dict[str, Any] = {}
+        if self._rigid_root_entities:
+            fields.update(
+                supports_interval_body_force=True,
+                supports_interval_body_torque=True,
+                supported_interval_terms=frozenset(
+                    {INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE}
+                ),
+            )
+        if pooled:
+            fields.update(
+                supports_fixed_variants=True,
+                supported_fixed_variant_layouts=frozenset({FixedVariantLayout.SAME_LAYOUT}),
+            )
+        return DomainRandomizationCapabilities(**fields)
+
+    def get_fixed_variant_metadata(self, entity: str) -> FixedVariantMetadata:
+        """Expand the worker-measured variant masses per environment.
+
+        The worker measures every pool variant's mass from the baked USD at
+        INIT and reports the table through the INIT metadata
+        (backend-authoritative measurement, interface-migration.md ruling 9);
+        this readback expands it to ``(num_envs,)`` with the pool assignment
+        already validated at payload assembly.  Every direction fails
+        closed: no pool, an entity the pool is not bound to, or missing
+        worker measurements raise instead of returning defaults.
+        """
+        if self._scene.fixed_variant_plan is None:
+            raise NotImplementedError(
+                f"{self._BACKEND_LABEL} scene carries no fixed variant pool"
+            )
+        self._require_materialized()
+        pool = self._init_variant_pool
+        assert pool is not None  # materialize() assembles it from the plan
+        meta = self._worker_init_meta
+        assert meta is not None  # set together with _model_info by materialize()
+        if entity != pool["target_entity"]:
+            raise ValueError(
+                f"{self._BACKEND_LABEL} fixed variant metadata requested for entity "
+                f"{entity!r} but the pool targets {pool['target_entity']!r}"
+            )
+        assignment_meta = meta.get("variant_assignment")
+        masses = None if assignment_meta is None else assignment_meta.get("masses")
+        if masses is None:
+            raise RuntimeError(
+                f"{self._BACKEND_LABEL} worker did not report measured variant masses"
+            )
+        measured = np.asarray([float(value) for value in masses], dtype=np.float64)
+        if measured.size != len(pool["source_files"]):
+            raise RuntimeError(
+                f"{self._BACKEND_LABEL} worker reported {measured.size} measured variant "
+                f"masses for {len(pool['source_files'])} pool sources"
+            )
+        return FixedVariantMetadata(
+            mass=measured[np.asarray(pool["assignments"], dtype=np.intp)],
+            variant_files=tuple(pool["source_files"]),
         )
 
     def _stage_body_wrench(

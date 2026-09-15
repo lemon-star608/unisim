@@ -9,7 +9,7 @@ import numpy as np
 
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
-    InitRandomizationPlan,
+    FixedVariantMetadata,
     IntervalRandomizationPlan,
     IntervalTermOp,
     ResetRandomizationPayload,
@@ -1033,6 +1033,19 @@ class SimBackend(abc.ABC):
     def get_dr_capabilities(self) -> DomainRandomizationCapabilities:
         """Return supported domain-randomization capabilities for this backend."""
 
+    def get_fixed_variant_metadata(self, entity: str) -> FixedVariantMetadata:
+        """Return backend-authoritative metadata for one entity's variant pool.
+
+        ``mass`` is the per-environment ``(num_envs,)`` measured mass of the
+        environment's assigned variant; ``variant_files`` lists the pool's
+        source files.  Backends without a materialized variant pool bound to
+        ``entity`` fail closed.  Callers must treat the returned array as
+        read-only.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not expose fixed variant metadata for '{entity}'"
+        )
+
     def get_reset_term_default(self, term: str) -> np.ndarray:
         """Return the authoritative default table for a curated reset term.
 
@@ -1048,14 +1061,6 @@ class SimBackend(abc.ABC):
             )
         raise NotImplementedError(
             f"{self.__class__.__name__} does not expose reset term defaults for '{term}'"
-        )
-
-    def apply_init_randomization(self, plan: InitRandomizationPlan) -> None:
-        """Apply cold-path model/materialization randomization."""
-        if plan.is_empty():
-            return
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support init-lifecycle randomization"
         )
 
     def materialize(self) -> None:

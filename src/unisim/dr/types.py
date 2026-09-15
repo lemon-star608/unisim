@@ -158,6 +158,41 @@ class FixedVariantPlan:
 
 
 @dataclass(frozen=True)
+class FixedVariantMetadata:
+    """Backend-authoritative readback for one entity's fixed variant pool.
+
+    ``mass`` is the measured mass of each environment's assigned variant,
+    normalized to a read-only float64 ``(num_envs,)`` array; the backend
+    expands the per-variant measurement table with the pool's assignment.
+    ``variant_files`` is the diagnostic source list of the materialized
+    pool.  Backend-authoritative; assignment/scale deliberately out of
+    scope (entity-scoped variant attribute flow pends upstream, see
+    interface-migration.md K4).
+    """
+
+    mass: np.ndarray
+    variant_files: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.variant_files, tuple):
+            raise TypeError("FixedVariantMetadata.variant_files must be a tuple")
+        if not all(isinstance(name, str) and name for name in self.variant_files):
+            raise TypeError(
+                "FixedVariantMetadata.variant_files must contain non-empty strings"
+            )
+
+        mass = np.asarray(self.mass, dtype=np.float64)
+        if mass.ndim != 1 or mass.size == 0:
+            raise ValueError("FixedVariantMetadata.mass must be a non-empty (num_envs,) array")
+        if not np.isfinite(mass).all():
+            raise ValueError("FixedVariantMetadata.mass must be finite")
+        if not mass.flags.writeable:
+            mass = mass.copy()
+        mass.setflags(write=False)
+        object.__setattr__(self, "mass", mass)
+
+
+@dataclass(frozen=True)
 class DomainRandomizationCapabilities:
     """Backend domain-randomization capability declaration.
 
@@ -403,98 +438,3 @@ class ResetPlan:
     qvel: np.ndarray
     info_updates: dict[str, Any]
     randomization: ResetRandomizationPayload | None = None
-
-
-# SimToolReal migration: legacy init-randomization channel retained until
-# the fixed-variant plan migration (M1.1); see interface-migration.md.
-@dataclass(frozen=True)
-class GeomSizeOverride:
-    geom_name: str
-    size: tuple[float, ...]
-
-
-@dataclass(frozen=True)
-class ModelVariantSpec:
-    """One model variant consumed by ``InitRandomizationPlan``.
-
-    Two mutually exclusive variant kinds:
-
-    - ``geom_size_overrides``: in-place geometry tweaks compiled from the
-      scene's base model (the historical MuJoCo variant path).
-    - ``source_model_file`` + ``source_format``: a whole-file variant that
-      replaces one scene role's asset (e.g. a tool URDF from a 1200-file
-      pool).  The format tag must be ``urdf`` or ``mjcf``; any other format
-      fails closed at validation time.  ``target_entity`` names the
-      ``SceneEntitySpec`` role whose asset the file replaces; ``None`` means
-      the scene's primary ``model_file``.  ``mass`` carries owner-side
-      physical metadata for task terms that need the assigned variant's mass
-      (for example SimToolReal's wrench sampler); the URDF remains the
-      physics source of truth.
-
-    The two kinds never mix on one spec: a whole-file variant carries its own
-    geometry, so size overrides would be ambiguous.
-    """
-
-    geom_size_overrides: tuple[GeomSizeOverride, ...] = field(default_factory=tuple)
-    source_model_file: str | None = None
-    source_format: str | None = None
-    target_entity: str | None = None
-    mass: float | None = None
-
-    def __post_init__(self) -> None:
-        # Deferred import: upstream ``unisim.scene`` now imports this module at
-        # module level (``FixedVariantPlan``), so a top-level import here would
-        # be circular.
-        from unisim.scene import SUPPORTED_MODEL_FORMATS
-
-        if self.source_format is not None and self.source_format not in SUPPORTED_MODEL_FORMATS:
-            raise ValueError(
-                f"ModelVariantSpec source_format must be one of "
-                f"{sorted(SUPPORTED_MODEL_FORMATS)}, got {self.source_format!r}; other "
-                "formats fail closed at contract validation time"
-            )
-        if (self.source_model_file is None) != (self.source_format is None):
-            raise ValueError(
-                "ModelVariantSpec source_model_file and source_format must be set "
-                f"together, got file={self.source_model_file!r} format={self.source_format!r}"
-            )
-        if self.source_model_file is not None:
-            if not self.source_model_file:
-                raise ValueError("ModelVariantSpec source_model_file must be non-empty")
-            if self.geom_size_overrides:
-                raise ValueError(
-                    "ModelVariantSpec source_model_file (whole-file variant) is mutually "
-                    "exclusive with geom_size_overrides (in-place geometry tweaks)"
-                )
-        if self.target_entity is not None:
-            if not self.target_entity:
-                raise ValueError("ModelVariantSpec target_entity must be a non-empty string")
-            if self.source_model_file is None:
-                raise ValueError(
-                    "ModelVariantSpec target_entity requires a whole-file variant "
-                    "(source_model_file); geom-only variants always apply to the base model"
-                )
-        if self.mass is not None:
-            numeric_mass = float(self.mass)
-            if not np.isfinite(numeric_mass) or numeric_mass < 0.0:
-                raise ValueError(
-                    "ModelVariantSpec mass must be finite and non-negative when provided, "
-                    f"got {self.mass!r}"
-                )
-            object.__setattr__(self, "mass", numeric_mass)
-        if self.mass is not None and self.source_model_file is None:
-            raise ValueError(
-                "ModelVariantSpec mass requires a whole-file source_model_file variant"
-            )
-
-    def is_empty(self) -> bool:
-        return not self.geom_size_overrides and self.source_model_file is None
-
-
-@dataclass
-class InitRandomizationPlan:
-    model_assignments: np.ndarray
-    model_variants: tuple[ModelVariantSpec, ...]
-
-    def is_empty(self) -> bool:
-        return len(self.model_variants) == 0
