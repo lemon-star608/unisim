@@ -700,6 +700,47 @@ def _validate_friction_triple_wire(value: Any, label: str) -> tuple[float, float
     return (triple[0], triple[1], triple[2])
 
 
+def parse_ground_plane_declaration(
+    payload_entry: Any,
+) -> tuple[tuple[float, float, float], float, float] | None:
+    """Re-validate the INIT ``ground_plane`` entry at the wire boundary.
+
+    Returns ``(friction_triple, restitution, size_m)`` or ``None`` when the
+    scene declares no ground plane (the legacy render-mode-only Nucleus
+    ground path applies, interface-migration.md final review I-1).  A
+    malformed declaration fails closed at INIT rather than silently
+    spawning a default ground the scene never asked for.
+    """
+    if payload_entry is None:
+        return None
+    if not isinstance(payload_entry, dict):
+        raise TypeError(
+            "isaacsim ground_plane declaration must be a dict, got "
+            f"{type(payload_entry).__name__}"
+        )
+    if set(payload_entry) != {"friction", "restitution", "size_m"}:
+        raise ValueError(
+            "isaacsim ground_plane declaration keys must be exactly "
+            f"friction/restitution/size_m, got {sorted(payload_entry)}"
+        )
+    friction = _validate_friction_triple_wire(
+        payload_entry["friction"], "isaacsim ground_plane friction"
+    )
+    restitution = float(payload_entry["restitution"])
+    size_m = float(payload_entry["size_m"])
+    if not math.isfinite(restitution) or restitution < 0.0:
+        raise ValueError(
+            "isaacsim ground_plane restitution must be a finite non-negative number, "
+            f"got {payload_entry['restitution']!r}"
+        )
+    if not math.isfinite(size_m) or size_m <= 0.0:
+        raise ValueError(
+            f"isaacsim ground_plane size_m must be a finite positive number, "
+            f"got {payload_entry['size_m']!r}"
+        )
+    return friction, restitution, size_m
+
+
 def parse_entity_friction(
     entry: dict[str, Any],
 ) -> tuple[tuple[float, float, float], dict[str, tuple[float, float, float]]] | None:
@@ -1146,6 +1187,7 @@ class _WorkerContext:
         self._fixed_base = bool(payload.get("fixed_base", False))
         entity_payloads = [dict(entry) for entry in (payload.get("entities") or [])]
         variant_pool = payload.get("variant_pool")
+        ground_plane = parse_ground_plane_declaration(payload.get("ground_plane"))
         rigid_spawn_cfgs: list[tuple[str, Any]] = []
         if entity_payloads:
             # SimToolReal step-1.3a multi-asset entry: one Articulation (the
@@ -1293,14 +1335,28 @@ class _WorkerContext:
         else:
             sim_cfg = sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
         self.sim = sim_utils.SimulationContext(sim_cfg)
-        # Ground plane: the original scene spawns a colliding /World/ground in
-        # training and playback alike (scene_utils.py:1807, spawn_ground_plane
-        # + GroundPlaneCfg defaults).  The default cfg's visual grid USD is a
-        # Nucleus asset and breaks offline cold starts, so author the same
-        # physics locally — collision plane plus the default rigid-body
-        # material (0.5/0.5/0.0) — and a neutral local visual quad
-        # (training-pipeline-reaudit F7 re-closure).
-        self._spawn_local_ground_plane()
+        # Ground plane is declared scene content, not worker policy
+        # (interface-migration.md final review I-1): the original repository
+        # assembles the floor as task-level scene composition (scene_utils.py
+        # setup_scene step 5: world-level /World/ground, GroundPlaneCfg
+        # defaults, spawned in training too).  A declared scene spawns the
+        # offline-safe local collision ground in every runtime mode — the
+        # default declaration reproduces the original GroundPlaneCfg physics
+        # parameter for parameter — while an undeclared scene keeps the
+        # pre-declaration legacy behavior verbatim.
+        if ground_plane is not None:
+            ground_friction, ground_restitution, ground_size_m = ground_plane
+            self._spawn_local_ground_plane(
+                friction=ground_friction,
+                restitution=ground_restitution,
+                size_m=ground_size_m,
+            )
+        elif render_mode != "none":
+            # Use IsaacSim's standard grid-world floor for rendered playback.
+            # The MJCF floor is retained for the task/physics contract, while
+            # this native floor supplies the normal IsaacSim visual ground.
+            ground_cfg = sim_utils.GroundPlaneCfg()
+            ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
         # IsaacLab's SimulationContext owns the singleton simulation stage and
         # must be materialized before assets/articulations bind to it.  Keep
         # this ordering explicit so a real Kit worker does not accidentally
@@ -1532,8 +1588,15 @@ class _WorkerContext:
         readback["solver_type"] = "default_tgs" if solver_value is None else solver_value
         return readback
 
-    def _spawn_local_ground_plane(self, prim_path: str = "/World/ground") -> None:
-        """Author the original scene's colliding ground without Nucleus.
+    def _spawn_local_ground_plane(
+        self,
+        prim_path: str = "/World/ground",
+        *,
+        friction: tuple[float, float, float] = (0.5, 0.5, 0.0),
+        restitution: float = 0.0,
+        size_m: float = 200.0,
+    ) -> None:
+        """Author the scene's declared colliding ground without Nucleus.
 
         ``spawn_ground_plane`` + ``GroundPlaneCfg`` (scene_utils.py:1807)
         creates ``/World/ground`` with a collision plane bound to the default
@@ -1541,12 +1604,20 @@ class _WorkerContext:
         asset that breaks offline cold starts, and this Kit build's UsdPhysics
         exposes neither ``PlaneAPI`` nor a writable ``UsdGeomPlane`` normal.
         This authors the ground as a large thin collision box whose top
-        surface is z=0, bound to the Isaac Lab default rigid-body material
-        (static/dynamic friction 0.5, restitution 0.0) — functionally
+        surface is z=0, bound to a rigid-body material — functionally
         equivalent for this task, whose falling objects terminate at
         z < 0.1 long before a bounded extent could matter.  Spawned in
         training (headless) and playback alike, matching the original scene
         contract; the box's own display color provides the visual floor.
+
+        Parameters come from the scene's ``GroundPlaneSceneCfg`` declaration
+        (INIT ``ground_plane`` entry): the triple's static and dynamic
+        components and ``restitution`` parameterize the material, and
+        ``size_m`` is the box's full side length.  With the declaration's
+        default values every authored parameter matches the original
+        unconditional spawn exactly (static/dynamic friction 0.5,
+        restitution 0.0, 200 m extent), so a default-declared scene
+        reproduces the original ground prim parameter for parameter.
         """
         from isaaclab.sim.spawners.materials import (
             RigidBodyMaterialCfg,  # type: ignore[import-not-found]
@@ -1563,8 +1634,8 @@ class _WorkerContext:
         # UsdPhysics exposes neither PlaneAPI nor a writable UsdGeomPlane
         # normal, and a bounded box is functionally equivalent here — falling
         # objects rest on the same z=0 surface long before reaching the
-        # ±100 m extent (fall terminates at object z < 0.1).
-        half = 100.0
+        # declared extent (fall terminates at object z < 0.1).
+        half = float(size_m) / 2.0
         thickness = 0.1
         box = UsdGeom.Cube.Define(stage, Sdf.Path(prim_path))
         box.CreateSizeAttr(1.0)
@@ -1575,10 +1646,16 @@ class _WorkerContext:
         box.CreateDisplayColorAttr([Gf.Vec3f(0.32, 0.34, 0.36)])
         UsdPhysics.CollisionAPI.Apply(box_prim)
 
-        # Isaac Lab's default rigid-body material: the same 0.5/0.5/0.0
-        # triple GroundPlaneCfg binds to the original ground (from_files_cfg
-        # RigidBodyMaterialCfg defaults; scene_utils.py:1807 uses cfg defaults).
-        material_cfg = RigidBodyMaterialCfg()
+        # Isaac Lab's default rigid-body material pattern, parameterized by
+        # the declaration: with GroundPlaneSceneCfg defaults this is exactly
+        # the 0.5/0.5/0.0 triple GroundPlaneCfg binds to the original ground
+        # (from_files_cfg RigidBodyMaterialCfg defaults; scene_utils.py:1807
+        # uses cfg defaults).
+        material_cfg = RigidBodyMaterialCfg(
+            static_friction=float(friction[0]),
+            dynamic_friction=float(friction[1]),
+            restitution=float(restitution),
+        )
         material_path = f"{prim_path}/physicsMaterial"
         material_cfg.func(material_path, material_cfg)
         bind_physics_material(prim_path, material_path)

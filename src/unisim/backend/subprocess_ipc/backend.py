@@ -584,6 +584,10 @@ class MjcfSubprocessBackend(SimBackend):
                     # fixed_base, and gain-resolved actuation arrays.  Empty
                     # list for legacy single-asset scenes.
                     "entities": self._entity_payloads(),
+                    # Declarative world-level ground plane (Fix-A,
+                    # interface-migration.md final review I-1): ``None`` keeps
+                    # each backend's native ground behavior.
+                    "ground_plane": self._ground_plane_payload(),
                     **self._init_randomization_payload(),
                 },
                 expect=protocol.CMD_META,
@@ -1092,6 +1096,24 @@ class MjcfSubprocessBackend(SimBackend):
         if self._init_variant_pool is None:
             return {}
         return {"variant_pool": dict(self._init_variant_pool)}
+
+    def _ground_plane_payload(self) -> dict[str, Any] | None:
+        """Serialize ``SceneCfg.ground_plane`` into the INIT payload (Fix-A).
+
+        ``None`` keeps each backend's native ground behavior; a declaration
+        carries the PhysX triple, the restitution scalar, and the extent in
+        meters.  The key is always present so the wire contract is explicit,
+        and workers without a declarative ground (isaacgym, mujoco family)
+        ignore it like every other composition key they do not consume.
+        """
+        declaration = self._scene.ground_plane
+        if declaration is None:
+            return None
+        return {
+            "friction": [float(value) for value in declaration.friction],
+            "restitution": float(declaration.restitution),
+            "size_m": float(declaration.size_m),
+        }
 
     def _validate_xml_metadata_against_worker(self) -> None:
         """Fail closed when the MJCF importer changed names or ordering.

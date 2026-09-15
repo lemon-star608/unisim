@@ -272,6 +272,51 @@ class SceneEntitySpec:
         return self.root_mode == ENTITY_ROOT_FIXED
 
 
+@dataclass(frozen=True)
+class GroundPlaneSceneCfg:
+    """Declarative world-level ground plane for offline-safe scenes.
+
+    Composition declaration consumed by adapters whose scene sources do not
+    carry a floor (e.g. the IsaacSim URDF multi-asset path); backends whose
+    model files already include a ground ignore it.  Defaults mirror
+    IsaacLab ``GroundPlaneCfg``'s physics material.
+
+    ``friction`` is the repo's PhysX material triple (static friction,
+    dynamic friction, restitution slot) validated like every other contact
+    declaration; the dedicated ``restitution`` field is the authoritative
+    material restitution, and ``size_m`` is the ground's full side length.
+    """
+
+    friction: tuple[float, float, float] = (0.5, 0.5, 0.0)
+    restitution: float = 0.0
+    size_m: float = 200.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "friction",
+            _validate_friction_triple(self.friction, "GroundPlaneSceneCfg friction"),
+        )
+        for field_name, value in (("restitution", self.restitution), ("size_m", self.size_m)):
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError(
+                    f"GroundPlaneSceneCfg {field_name} must be a finite number, got {value!r}"
+                )
+        if float(self.restitution) < 0.0:
+            raise ValueError(
+                f"GroundPlaneSceneCfg restitution must be a finite non-negative number, "
+                f"got {self.restitution!r}"
+            )
+        if float(self.size_m) <= 0.0:
+            raise ValueError(
+                f"GroundPlaneSceneCfg size_m must be a finite positive number, "
+                f"got {self.size_m!r}"
+            )
+        object.__setattr__(self, "restitution", float(self.restitution))
+        object.__setattr__(self, "size_m", float(self.size_m))
+
+
 @dataclass
 class SceneCfg:
     """Scene source and optional cold-path composition configuration."""
@@ -279,6 +324,16 @@ class SceneCfg:
     model_file: str
     fragment_files: list[str] = field(default_factory=list)
     terrain: TerrainSceneCfg | None = None
+    ground_plane: GroundPlaneSceneCfg | None = None
+    """Declarative world-level ground plane (composition declaration).
+
+    The IsaacSim worker consumes it as a world-level local collision ground
+    in every runtime mode (task-level scene composition in the original
+    repository: ``scene_utils.py`` ``setup_scene`` step 5); an undeclared
+    scene keeps each backend's native ground behavior, and backends whose
+    model files already include a ground ignore the declaration.  Upstream
+    composition-contract proposal: interface-migration.md K2.
+    """
     entities: dict[str, object] = field(default_factory=dict)
     """Logical entity partitions materialized by the base-owned manager facade."""
     entity_assets: tuple[SceneEntitySpec, ...] = ()
