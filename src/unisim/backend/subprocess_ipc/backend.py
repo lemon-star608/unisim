@@ -1546,10 +1546,16 @@ class MjcfSubprocessBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def set_pre_step_control(self, fn: Any | None) -> None:
+        # Fail closed on registration: every physics substep is integrated
+        # inside the worker process, so storing a host callback would silently
+        # drop it (declared gap, interface-migration.md §5).  Clearing with
+        # ``None`` keeps the base unregister contract because "no callback" is
+        # this family's real state.
         if fn is not None:
             raise NotImplementedError(
-                f"{self._BACKEND_LABEL} rejects host pre-step callbacks; a per-substep callback "
-                "cannot cross the worker process boundary inside one physics substep."
+                f"{self._BACKEND_LABEL} pre-step control callbacks require per-substep host "
+                "control inside the physics worker; not implemented for the subprocess family "
+                "(declared gap, see interface-migration.md §5)"
             )
         self._pre_step_control_fn = None
 

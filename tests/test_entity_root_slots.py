@@ -555,3 +555,25 @@ def test_set_state_cancels_staged_wrench_rows(multi_asset_backend):
     np.testing.assert_array_equal(
         backend._slots[protocol.WRENCH_TORQUE_SLOT][untouched], -5.0
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-step control registration (declared gap, interface-migration.md §5)
+# ---------------------------------------------------------------------------
+
+
+def test_set_pre_step_control_fails_closed(legacy_backend):
+    """Registering a per-substep host callback fails closed on the family.
+
+    Every physics substep is integrated inside the worker process, so a host
+    callback cannot run inside one; accepting the registration would silently
+    drop it (declared gap, interface-migration.md §5).  Clearing with ``None``
+    keeps the base unregister contract because "no callback" is this family's
+    real state.
+    """
+    with pytest.raises(NotImplementedError, match="declared gap"):
+        legacy_backend.set_pre_step_control(lambda owner, ctrl: ctrl)
+    # ``None`` stays the accepted clear: position-actuator envs keep the
+    # direct control path and never register a callback.
+    legacy_backend.set_pre_step_control(None)
+    assert legacy_backend._pre_step_control_fn is None
