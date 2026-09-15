@@ -21,7 +21,7 @@ import select
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -39,7 +39,11 @@ from unisim.backend.base import (
     normalize_play_render_mode,
     unsupported_debug_overlay_error,
 )
-from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
+from unisim.dr.interval import (
+    INTERVAL_TERM_BODY_FORCE,
+    INTERVAL_TERM_BODY_TORQUE,
+    IntervalTermOp,
+)
 from unisim.dr.types import (
     DomainRandomizationCapabilities,
     FixedVariantLayout,
@@ -1542,10 +1546,16 @@ class MjcfSubprocessBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def set_pre_step_control(self, fn: Any | None) -> None:
+        # Fail closed on registration: every physics substep is integrated
+        # inside the worker process, so storing a host callback would silently
+        # drop it (declared gap, interface-migration.md §5).  Clearing with
+        # ``None`` keeps the base unregister contract because "no callback" is
+        # this family's real state.
         if fn is not None:
             raise NotImplementedError(
-                f"{self._BACKEND_LABEL} rejects host pre-step callbacks; a per-substep callback "
-                "cannot cross the worker process boundary inside one physics substep."
+                f"{self._BACKEND_LABEL} pre-step control callbacks require per-substep host "
+                "control inside the physics worker; not implemented for the subprocess family "
+                "(declared gap, see interface-migration.md §5)"
             )
         self._pre_step_control_fn = None
 
@@ -1804,13 +1814,22 @@ class MjcfSubprocessBackend(SimBackend):
             variant_files=tuple(pool["source_files"]),
         )
 
-    def _stage_body_wrench(
+    def apply_body_force(
         self,
         body_ids: np.ndarray,
         force: np.ndarray,
-        torque: np.ndarray | None,
+        torque: np.ndarray | None = None,
     ) -> None:
-        """Accumulate one public body-wrench operation into dense shm slots."""
+        """Apply a world-frame force (and optional torque) to rigid roots.
+
+        Base-contract staging entry: ``body_ids`` select rigid entity roots,
+        ``force`` has shape ``(num_envs, len(body_ids), 3)`` in the world
+        frame, and ``torque`` is optional with the same shape.  Values
+        accumulate into the dense ``WRENCH_FORCE_SLOT``/``WRENCH_TORQUE_SLOT``
+        shm rows; the worker applies them at the next control step and clears
+        the slots afterwards, and ``set_state`` zeroes the selected rows so a
+        freshly reset row never receives a pre-reset impulse.
+        """
         if not self._rigid_root_entities:
             raise NotImplementedError(
                 f"{self._BACKEND_LABEL} worker has no rigid-entity wrench slots"
@@ -1844,8 +1863,41 @@ class MjcfSubprocessBackend(SimBackend):
         self._slots[protocol.WRENCH_FORCE_SLOT][:, ids, :] += values
         self._slots[protocol.WRENCH_TORQUE_SLOT][:, ids, :] += torque_values
 
+    _interval_handlers: dict[str, Callable[[IntervalTermOp], None]] | None = None
+
+    def _interval_term_handlers(self) -> dict[str, Callable[[IntervalTermOp], None]]:
+        """Return the wrench staging handler table, built lazily exactly once.
+
+        Both wrench terms route through the public :meth:`apply_body_force`
+        staging entry; every other term fails closed in the base dispatch.
+        The empty-table case is deliberately not cached: rigid roots bind at
+        INIT metadata binding (cold path), so a pre-INIT ``{}`` must not
+        shadow the real table a rigid scene acquires afterwards.
+        """
+        if not self._rigid_root_entities:
+            return {}
+        if self._interval_handlers is None:
+            self._interval_handlers = {
+                INTERVAL_TERM_BODY_FORCE: (
+                    lambda op: self.apply_body_force(op.body_ids, op.payload, None)
+                ),
+                INTERVAL_TERM_BODY_TORQUE: (
+                    lambda op: self.apply_body_force(
+                        op.body_ids,
+                        np.zeros_like(op.payload, dtype=np.float32),
+                        op.payload,
+                    )
+                ),
+            }
+        return self._interval_handlers
+
     def apply_interval_randomization(self, plan: IntervalRandomizationPlan) -> None:
-        """Stage interval force/torque rows for the next worker control step."""
+        """Stage interval force/torque rows for the next worker control step.
+
+        Thin prologue override per the base contract: a non-empty plan on a
+        rigid scene starts from cleared wrench slots, then the base handler
+        table dispatch accumulates the ops through the staging entry.
+        """
         if plan.is_empty():
             return
         if not self._rigid_root_entities:
@@ -1853,20 +1905,7 @@ class MjcfSubprocessBackend(SimBackend):
         self._require_state("apply_interval_randomization")
         self._slots[protocol.WRENCH_FORCE_SLOT].fill(0.0)
         self._slots[protocol.WRENCH_TORQUE_SLOT].fill(0.0)
-        for op in plan.iter_ops():
-            op.validate()
-            if op.term == INTERVAL_TERM_BODY_FORCE:
-                assert op.body_ids is not None
-                self._stage_body_wrench(op.body_ids, op.payload, None)
-            elif op.term == INTERVAL_TERM_BODY_TORQUE:
-                assert op.body_ids is not None
-                zeros = np.zeros_like(op.payload, dtype=np.float32)
-                self._stage_body_wrench(op.body_ids, zeros, op.payload)
-            else:
-                raise NotImplementedError(
-                    f"{self._BACKEND_LABEL} multi-asset worker does not support interval "
-                    f"term {op.term!r}"
-                )
+        super().apply_interval_randomization(plan)
 
     # ------------------------------------------------------------------ #
     # Native rendering / playback (worker-owned viewer and camera sensor)
