@@ -876,6 +876,47 @@ def _verify_baked_usd(usd_path: str, plan: _EntityBakePlan) -> dict[str, int]:
     return {**counts, "collision_enabled": collision_enabled_values}
 
 
+def _readback_variant_masses(usd_paths: list[str]) -> list[float]:
+    """Measure the physics mass of every baked pool variant USD (fail-closed).
+
+    Backend-authoritative mass source for the fixed-variant channel: each
+    pool variant is a single-link rigid tool, so its USD must carry exactly
+    one ``UsdPhysics.RigidBodyAPI`` prim, and the ``UsdPhysics.MassAPI``
+    mass on that prim must be readable, finite, and strictly positive.
+    Provenance change (interface-migration.md ruling 9): variant mass used
+    to be echoed back from an optional INIT payload key; the payload no
+    longer carries masses, and this measurement of the materialized variant
+    USD is the only source reported through the INIT metadata.  The goalviz
+    mirror pool is deliberately never measured (kinematic, non-physical).
+    """
+    from pxr import Usd, UsdPhysics  # type: ignore[import-not-found]
+
+    masses: list[float] = []
+    for usd_path in usd_paths:
+        stage = Usd.Stage.Open(str(usd_path))
+        if stage is None:
+            raise ValueError(f"failed to open variant USD for mass readback: {usd_path}")
+        bodies = [
+            prim
+            for prim in Usd.PrimRange(stage.GetPseudoRoot())
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        ]
+        if len(bodies) != 1:
+            raise ValueError(
+                f"variant USD {os.path.basename(usd_path)} must carry exactly one "
+                f"rigid-body prim for mass readback, found {len(bodies)}"
+            )
+        attr = UsdPhysics.MassAPI(bodies[0]).GetMassAttr()
+        mass = attr.Get() if attr else None
+        if mass is None or not math.isfinite(float(mass)) or float(mass) <= 0.0:
+            raise ValueError(
+                f"variant USD {os.path.basename(usd_path)} rigid body has no readable "
+                f"positive physics:mass, got {mass!r}"
+            )
+        masses.append(float(mass))
+    return masses
+
+
 def _verify_self_collision_filters(
     usd_path: str, adjacency: dict[str, list[str]]
 ) -> dict[str, int]:
@@ -962,10 +1003,12 @@ class _WorkerContext:
         # entry owns an entity_root_state__/entity_reset_state__ slot pair
         # (step 1.3c) attached by the host after INIT.
         self.rigid_objects: dict[str, Any] = {}
-        # (target entity name, converted pool USD paths) when an init
-        # randomization variant pool was materialized; used for the INIT
-        # round-robin forensics report.
-        self._variant_pool_usds: tuple[str, list[str]] | None = None
+        # (target entity name, converted pool USD paths, measured per-variant
+        # masses) when an init randomization variant pool was materialized;
+        # used for the INIT round-robin forensics report and the
+        # backend-authoritative mass readback (interface-migration.md
+        # ruling 9: measurement, not payload echo).
+        self._variant_pool_usds: tuple[str, list[str], list[float]] | None = None
         # (entity_name, source_pool_target, usd_paths) when a kinematic entity
         # mirrors a declared variant pool (SimToolReal goalviz, 2026-09-14).
         self._goalviz_mirror: tuple[str, str, list[str]] | None = None
@@ -1428,16 +1471,17 @@ class _WorkerContext:
             # Scene-level PhysxCfg effective values (pipeline-audit.md F1).
             meta["scene_physx"] = self._readback_scene_physx()
             if self._variant_pool_usds is not None:
-                target_name, pool_usds = self._variant_pool_usds
+                target_name, pool_usds, measured_masses = self._variant_pool_usds
                 meta["variant_assignment"] = {
                     "target_entity": target_name,
                     "expected": [int(value) for value in variant_pool["assignments"]],
                     "observed": self._observe_variant_assignment(target_name, pool_usds),
+                    # Backend-authoritative measurement of the baked variant
+                    # USDs (interface-migration.md ruling 9): the payload
+                    # echo is gone, so this is the only mass source; one
+                    # finite value per pool source file.
+                    "masses": [float(value) for value in measured_masses],
                 }
-                if "masses" in variant_pool:
-                    meta["variant_assignment"]["masses"] = [
-                        float(value) for value in variant_pool["masses"]
-                    ]
             if self._goalviz_mirror is not None:
                 mirror_name, mirror_source, mirror_usds = self._goalviz_mirror
                 meta["goalviz_mirror"] = {
@@ -1829,6 +1873,14 @@ class _WorkerContext:
                             materialization, root_mode, role=name, is_variant_target=True
                         ),
                     )
+                # Backend-authoritative mass measurement of the baked pool
+                # (SimToolReal M1.3, interface-migration.md ruling 9): the
+                # INIT payload never carries masses, so the worker reads
+                # each variant's physics mass back from the materialized
+                # USD, failing INIT closed on any ambiguity.  Only this
+                # dynamic object pool is measured; the goalviz mirror below
+                # bakes kinematic non-physical copies.
+                measured_masses = _readback_variant_masses(pool_usds)
                 assignments = pool["assignments"]
                 # ``MultiUsdFileCfg(random_choice=False)`` itself selects
                 # prototype ``env_index % len(usd_path)``.  The task-owned
@@ -1846,7 +1898,7 @@ class _WorkerContext:
                     else [pool_usds[assignments[index]] for index in range(self.num_envs)]
                 )
                 entry["_usd_path"] = spawn_usds
-                self._variant_pool_usds = (name, pool_usds)
+                self._variant_pool_usds = (name, pool_usds, measured_masses)
                 # scene_utils.py:187-192: plain MultiUsdFileCfg round-robin;
                 # all physics is authored by the bake above.
                 spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
