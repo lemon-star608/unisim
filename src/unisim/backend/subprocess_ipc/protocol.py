@@ -92,8 +92,8 @@ _SLOT_DTYPES: Dict[str, str] = {
 }
 
 # Optional interval-wrench slots. They are allocated only for scenes that
-# declare rigid entities, so legacy single-articulation ATTACH payloads keep
-# the original SLOT_NAMES/layout byte-for-byte.
+# declare rigid entities; single-articulation scenes keep the original
+# SLOT_NAMES/layout.
 WRENCH_FORCE_SLOT = "wrench_force"
 WRENCH_TORQUE_SLOT = "wrench_torque"
 
@@ -108,8 +108,8 @@ state of one rigid entity root — pos xyz, quat wxyz, linear velocity, world
 angular velocity (same layout as ``root_state``).  ``entity_reset_state__<name>``
 is the write direction consumed by ``SET_STATE``: one (num_envs, 13) row per
 env — pos xyz, quat wxyz, world linear velocity, world angular velocity.
-Both families exist only when the scene declares rigid scene entities; legacy
-single-articulation layouts are byte-identical (``SLOT_NAMES`` is unchanged).
+Both families exist only when the scene declares rigid scene entities;
+single-articulation scenes allocate exactly ``SLOT_NAMES``.
 """
 
 _ENTITY_SLOT_NAME_PREFIXES = (ENTITY_ROOT_STATE_SLOT_PREFIX, ENTITY_RESET_STATE_SLOT_PREFIX)

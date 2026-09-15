@@ -504,6 +504,56 @@ def test_assignment_shape_mismatch_fails_closed(variant_files, robot_file):
         _backend(robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2]))
 
 
+# ---------------------------------------------------------------------------
+# Round-robin-only performance contract (arbitrary assignment fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def test_non_round_robin_assignment_fails_closed_at_staging(variant_files, robot_file):
+    # An arbitrary assignment would expand to one prototype per environment
+    # (O(num_envs) stage authoring); it fails closed at staging with an
+    # actionable error instead of silently degrading, and no worker spawns.
+    backend = _backend(
+        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 0, 0, 0])
+    )
+    with pytest.raises(NotImplementedError, match="round-robin"):
+        backend.materialize()
+    assert backend.requests == []
+    with pytest.raises(NotImplementedError, match="round-robin"):
+        build_init_variant_pool_payload(
+            _plan(variant_files, [1, 1, 1, 1]),
+            num_envs=NUM_ENVS,
+            entity_assets=(_object_spec(str(variant_files[0])),),
+            backend_label="isaacsim",
+        )
+
+
+def test_worker_wire_rejects_non_round_robin_assignment(variant_files):
+    from unisim.backend.isaacsim.worker import _WorkerContext
+
+    ctx = _WorkerContext.__new__(_WorkerContext)
+    ctx.num_envs = NUM_ENVS
+    entities = [{"name": "object", "materialization": "rigid", "root_mode": "floating"}]
+    good = ctx._validate_variant_pool_payload(
+        {
+            "target_entity": "object",
+            "source_files": [str(path) for path in variant_files],
+            "assignments": [0, 1, 2, 0],
+        },
+        entities,
+    )
+    assert good["assignments"] == [0, 1, 2, 0]
+    with pytest.raises(NotImplementedError, match="round-robin"):
+        ctx._validate_variant_pool_payload(
+            {
+                "target_entity": "object",
+                "source_files": [str(path) for path in variant_files],
+                "assignments": [0, 0, 0, 0],
+            },
+            entities,
+        )
+
+
 def test_uniform_public_layout_plan_fails_closed_at_staging(variant_files, robot_file):
     # The pool realizes one rigid body per variant (SAME_LAYOUT); a plan that
     # promises UNIFORM_PUBLIC_LAYOUT optional slots cannot be materialized and
@@ -555,7 +605,7 @@ def test_source_files_resolve_relative_and_home_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(tmp_path)
     plan = FixedVariantPlan(
-        assignment=np.zeros(2, dtype=np.int64),
+        assignment=np.asarray([0, 1], dtype=np.int64),
         variants=(
             ModelSourceDescriptor(model_file="rel_0.urdf"),
             ModelSourceDescriptor(model_file=str(tmp_path / "rel_1.urdf")),
@@ -575,7 +625,7 @@ def test_source_files_resolve_relative_and_home_paths(tmp_path, monkeypatch):
             str((tmp_path / "rel_1.urdf").resolve()),
             str((home / "tool.urdf").resolve()),
         ],
-        "assignments": [0, 0],
+        "assignments": [0, 1],
     }
 
 

@@ -215,10 +215,27 @@ def build_init_variant_pool_payload(
         source_files.append(str(path.resolve()))
 
     variant_plan.validate(num_envs)
+    assignments = [int(value) for value in variant_plan.assignment]
+    # Performance contract: only the deterministic round-robin assignment is
+    # supported.  It maps onto K unique prototypes (``MultiUsdFileCfg`` with
+    # ``random_choice=False`` materializes environment i from source
+    # ``i % K``), so the worker builds K assets regardless of the environment
+    # count.  An arbitrary assignment would need one prototype reference per
+    # environment (O(num_envs) stage authoring — 12,288 redundant prototypes
+    # at production smoke sizes) and fails closed here instead of silently
+    # degrading; the exact per-env spawner is a planned follow-up.
+    expected_round_robin = [index % len(source_files) for index in range(num_envs)]
+    if assignments != expected_round_robin:
+        raise NotImplementedError(
+            f"{backend_label} fixed variant pool supports round-robin assignments only "
+            f"(assignment[i] == i % {len(source_files)}); an arbitrary per-env "
+            "assignment would expand to one prototype per environment — the exact "
+            "K-prototype spawner is a planned follow-up"
+        )
     return {
         "target_entity": target,
         "source_files": source_files,
-        "assignments": [int(value) for value in variant_plan.assignment],
+        "assignments": assignments,
     }
 
 
@@ -373,6 +390,14 @@ class MjcfSubprocessBackend(SimBackend):
         """Return whether this adapter's worker consumes ``SceneCfg.ground_plane``."""
         return False
 
+    def _supports_scene_physx(self) -> bool:
+        """Return whether this adapter's worker consumes ``SceneCfg.physx``."""
+        return False
+
+    def _supports_env_grid_spacing(self) -> bool:
+        """Return whether this adapter's worker consumes ``SceneCfg.env_grid_spacing``."""
+        return False
+
     def _worker_init_payload(self) -> dict[str, Any]:
         """Return backend-owned cold-path INIT options.
 
@@ -448,7 +473,16 @@ class MjcfSubprocessBackend(SimBackend):
             self._BACKEND_LABEL,
             supports_entity_assets=self._supports_entity_assets(),
             supports_ground_plane=self._supports_ground_plane(),
+            supports_scene_physx=self._supports_scene_physx(),
+            supports_env_grid_spacing=self._supports_env_grid_spacing(),
         )
+        if scene.env_grid_spacing is not None:
+            spacing = float(scene.env_grid_spacing)
+            if not np.isfinite(spacing) or spacing <= 0.0:
+                raise ValueError(
+                    f"{self._BACKEND_LABEL} env_grid_spacing must be a finite positive "
+                    f"number, got {scene.env_grid_spacing!r}"
+                )
         if scene.fixed_variant_plan is not None:
             scene.fixed_variant_plan.validate(int(num_envs))
             if not self._supports_fixed_variant_plans():
@@ -505,7 +539,7 @@ class MjcfSubprocessBackend(SimBackend):
         # Each owns one ``entity_root_state__<name>``/``entity_reset_state__<name>``
         # shm slot pair; its scanned root body name maps to the extended body id
         # ``num_bodies + k`` so the public body getters route to the new slot.
-        # Empty for legacy single-articulation scenes.
+        # Empty for single-articulation scenes.
         self._rigid_root_entities: tuple[str, ...] = ()
         self._rigid_root_body_names: dict[str, str] = {}
         self._base_body_id = 0
@@ -603,7 +637,7 @@ class MjcfSubprocessBackend(SimBackend):
                     "mjcf_body_names": list(self._get_scene_metadata().body_names),
                     "mjcf_joint_names": list(self._get_scene_metadata().joint_names),
                     # Fixed variants carry their own per-source actuation and
-                    # keyframe tables; the legacy single-model fields are omitted
+                    # keyframe tables; the single-model fields are omitted
                     # rather than duplicated (or allowed to conflict).
                     **(
                         {}
@@ -618,14 +652,20 @@ class MjcfSubprocessBackend(SimBackend):
                         }
                     ),
                     **fixed_variant_payload,
-                    # Multi-asset scenes (SimToolReal step 1): per-role asset,
-                    # fixed_base, and gain-resolved actuation arrays.  Empty
-                    # list for legacy single-asset scenes.
+                    # Multi-asset scenes: per-role asset, fixed_base, and
+                    # gain-resolved actuation arrays.  Empty list for
+                    # single-asset scenes.
                     "entities": self._entity_payloads(),
-                    # Declarative world-level ground plane (Fix-A,
-                    # interface-migration.md final review I-1): ``None`` keeps
-                    # each backend's native ground behavior.
+                    # Declarative world-level ground plane: ``None`` keeps
+                    # the backend's native ground behavior.
                     "ground_plane": self._ground_plane_payload(),
+                    # Scene-level PhysX solver declaration (``None`` keeps
+                    # the backend's own defaults) and the environment clone
+                    # grid spacing (``None`` keeps the backend's native
+                    # layout; the IsaacSim worker's GridCloner default is
+                    # 2.0 m).
+                    "scene_physx": self._scene_physx_payload(),
+                    "env_grid_spacing": self._env_grid_spacing_payload(),
                     **self._init_randomization_payload(),
                 },
                 expect=protocol.CMD_META,
@@ -1091,7 +1131,7 @@ class MjcfSubprocessBackend(SimBackend):
         can materialize one articulation/rigid object per role.  Contact
         material declarations (``friction``/``friction_by_body``) are appended
         only when the spec declares them.  Empty when the scene declares no
-        ``entity_assets``; the legacy top-level keys are unchanged either way.
+        ``entity_assets``; the single-asset top-level keys are unchanged.
         """
         specs = tuple(self._scene.entity_assets)
         if not specs:
@@ -1118,7 +1158,7 @@ class MjcfSubprocessBackend(SimBackend):
                 ),
             }
             # Contact materials are opt-in: undeclared entities carry no
-            # friction keys at all, keeping legacy payloads byte-identical.
+            # friction keys at all.
             if spec.contact_friction is not None:
                 entry["friction"] = [float(value) for value in spec.contact_friction]
                 if spec.contact_friction_by_body:
@@ -1126,11 +1166,27 @@ class MjcfSubprocessBackend(SimBackend):
                         override.body_name: [float(value) for value in override.friction]
                         for override in spec.contact_friction_by_body
                     }
+            # Composition is declaration-driven: spawn pose, USD-bake
+            # collision flag, converter capsule flag, and the pool mirror
+            # binding ride the entity entry only when declared.
+            if spec.init_state is not None:
+                entry["init_state"] = {
+                    "pos": [float(value) for value in spec.init_state.pos],
+                    "rot_wxyz": [float(value) for value in spec.init_state.rot_wxyz],
+                }
+            if spec.collision_enabled is not None:
+                entry["collision_enabled"] = bool(spec.collision_enabled)
+            if spec.replace_cylinders_with_capsules is not None:
+                entry["replace_cylinders_with_capsules"] = bool(
+                    spec.replace_cylinders_with_capsules
+                )
+            if spec.mirrors_fixed_variant_pool:
+                entry["mirrors_fixed_variant_pool"] = True
             payloads.append(entry)
         return payloads
 
     def _init_randomization_payload(self) -> dict[str, Any]:
-        """INIT entry for the validated variant pool; empty for legacy scenes."""
+        """INIT entry for the validated variant pool; absent for unpolled scenes."""
         if self._init_variant_pool is None:
             return {}
         return {"variant_pool": dict(self._init_variant_pool)}
@@ -1153,6 +1209,30 @@ class MjcfSubprocessBackend(SimBackend):
             "restitution": float(declaration.restitution),
             "size_m": float(declaration.size_m),
         }
+
+    def _scene_physx_payload(self) -> dict[str, Any] | None:
+        """Serialize ``SceneCfg.physx`` into the INIT payload.
+
+        ``None`` keeps the worker's own PhysX defaults; a declaration carries
+        the validated :class:`ScenePhysxCfg` fields verbatim.  The key is
+        always present so the wire contract is explicit, and only adapters
+        whose worker applies scene-level PhysX settings reach this
+        serialization.
+        """
+        declaration = self._scene.physx
+        if declaration is None:
+            return None
+        return dict(declaration.as_kwargs())
+
+    def _env_grid_spacing_payload(self) -> float | None:
+        """Serialize ``SceneCfg.env_grid_spacing`` into the INIT payload.
+
+        ``None`` keeps the worker's native environment layout; the IsaacSim
+        worker's ``GridCloner`` default is 2.0 m.  The key is always present
+        so the wire contract is explicit.
+        """
+        spacing = self._scene.env_grid_spacing
+        return None if spacing is None else float(spacing)
 
     def _validate_xml_metadata_against_worker(self) -> None:
         """Fail closed when the MJCF importer changed names or ordering.
@@ -1192,8 +1272,7 @@ class MjcfSubprocessBackend(SimBackend):
             self._model_info.num_bodies,
             rigid_root_entities=self._rigid_root_entities,
         )
-        # Legacy scenes: shapes keys are exactly protocol.SLOT_NAMES, so the
-        # allocation sequence (and the ATTACH payload) is byte-identical.
+        # Scenes without rigid entities allocate exactly protocol.SLOT_NAMES.
         for name, shape in shapes.items():
             handle = shared_memory.SharedMemory(create=True, size=protocol.slot_nbytes(name, shape))
             self._shm_handles[name] = handle
@@ -1609,14 +1688,14 @@ class MjcfSubprocessBackend(SimBackend):
     def set_pre_step_control(self, fn: Any | None) -> None:
         # Fail closed on registration: every physics substep is integrated
         # inside the worker process, so storing a host callback would silently
-        # drop it (declared gap, interface-migration.md §5).  Clearing with
+        # drop it (declared gap).  Clearing with
         # ``None`` keeps the base unregister contract because "no callback" is
         # this family's real state.
         if fn is not None:
             raise NotImplementedError(
                 f"{self._BACKEND_LABEL} pre-step control callbacks require per-substep host "
                 "control inside the physics worker; not implemented for the subprocess family "
-                "(declared gap, see interface-migration.md §5)"
+                "(declared gap)"
             )
         self._pre_step_control_fn = None
 
@@ -1747,7 +1826,7 @@ class MjcfSubprocessBackend(SimBackend):
         upload_t0 = time.perf_counter()
         count = int(rows.size)
         # A reset cancels any wrench staged for the selected rows by an
-        # interval event earlier in the same control step (reaudit fix P1).
+        # interval event earlier in the same control step.
         # The original clears its wrench buffers inside the task reset
         # (reset_utils.py:405-406), so a freshly reset row must not receive a
         # pre-reset impulse; the worker applies these slots at the next
@@ -1865,7 +1944,7 @@ class MjcfSubprocessBackend(SimBackend):
 
         The worker measures every pool variant's mass from the baked USD at
         INIT and reports the table through the INIT metadata
-        (backend-authoritative measurement, interface-migration.md ruling 9);
+        (backend-authoritative measurement, not a payload echo);
         this readback expands it to ``(num_envs,)`` with the pool assignment
         already validated at payload assembly.  Every direction fails
         closed: no pool, an entity the pool is not bound to, or missing

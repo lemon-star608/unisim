@@ -128,6 +128,14 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         """The worker spawns the declared world-level ground plane."""
         return True
 
+    def _supports_scene_physx(self) -> bool:
+        """The worker applies the declared scene-level PhysX configuration."""
+        return True
+
+    def _supports_env_grid_spacing(self) -> bool:
+        """The worker lays out the environment clone grid at the declared spacing."""
+        return True
+
     def _validate_fixed_variant_handshake(self, meta: dict[str, Any]) -> None:
         """Require the worker to echo the entity pool it materialized.
 
@@ -203,19 +211,23 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         INIT ``variant_pool`` key while the legacy keyframe/actuation
         fields keep the training-time payload shape.  Every direction
         fails closed here, before any worker process is spawned: a plan
-        without exactly one declared consumer, a consumer without a plan,
-        or a consumer whose entity shape cannot host a variant pool.
+        without exactly one declared consumer, a consumer or mirror
+        declarer without a plan, or a consumer whose entity shape cannot
+        host a variant pool.
         """
         plan = self._scene.fixed_variant_plan
         declared = [
-            spec for spec in self._scene.entity_assets if spec.consumes_fixed_variant_pool
+            spec
+            for spec in self._scene.entity_assets
+            if spec.consumes_fixed_variant_pool or spec.mirrors_fixed_variant_pool
         ]
         if plan is None:
             if declared:
                 names = sorted(spec.name for spec in declared)
                 raise ValueError(
-                    f"{self._BACKEND_LABEL} scene entities {names} declare "
-                    "consumes_fixed_variant_pool=True but the scene carries no "
+                    f"{self._BACKEND_LABEL} scene entities {names} declare a fixed "
+                    "variant pool binding (consumes_fixed_variant_pool or "
+                    "mirrors_fixed_variant_pool) but the scene carries no "
                     "fixed_variant_plan; refusing to materialize a partial variant channel"
                 )
         else:

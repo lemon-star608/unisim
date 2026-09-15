@@ -156,6 +156,136 @@ class BodyFrictionOverride:
 
 
 @dataclass(frozen=True)
+class ScenePhysxCfg:
+    """Scene-level PhysX solver declaration consumed by PhysX backends.
+
+    Field defaults mirror IsaacLab's ``PhysxCfg`` so a partial declaration
+    overrides exactly the authored fields.  ``SceneCfg.physx=None`` (the
+    scene default) keeps the backend's own defaults; declaring this block is
+    what opts a scene into explicit scene-level solver tuning (iteration
+    clamps, bounce threshold, GPU contact stream buffers).  Values are the
+    raw PhysX quantities: ``solver_type`` is the PhysX enum (0 = PGS,
+    1 = TGS).
+    """
+
+    solver_type: int = 1
+    min_position_iteration_count: int = 1
+    max_position_iteration_count: int = 255
+    min_velocity_iteration_count: int = 0
+    max_velocity_iteration_count: int = 255
+    bounce_threshold_velocity: float = 0.5
+    friction_offset_threshold: float = 0.04
+    friction_correlation_distance: float = 0.025
+    gpu_max_rigid_contact_count: int = 2**23
+    gpu_max_rigid_patch_count: int = 5 * 2**15
+
+    _INT_FIELDS = (
+        "min_position_iteration_count",
+        "max_position_iteration_count",
+        "min_velocity_iteration_count",
+        "max_velocity_iteration_count",
+        "gpu_max_rigid_contact_count",
+        "gpu_max_rigid_patch_count",
+    )
+    _FLOAT_FIELDS = (
+        "bounce_threshold_velocity",
+        "friction_offset_threshold",
+        "friction_correlation_distance",
+    )
+
+    def __post_init__(self) -> None:
+        solver = self.solver_type
+        if (
+            isinstance(solver, bool)
+            or not isinstance(solver, (int, np.integer))
+            or int(solver) not in (0, 1)
+        ):
+            raise ValueError(
+                f"ScenePhysxCfg solver_type must be 0 (PGS) or 1 (TGS), got {solver!r}"
+            )
+        object.__setattr__(self, "solver_type", int(solver))
+        for field_name in self._INT_FIELDS:
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                or int(value) < 0
+            ):
+                raise ValueError(
+                    f"ScenePhysxCfg {field_name} must be a non-negative integer, "
+                    f"got {value!r}"
+                )
+            object.__setattr__(self, field_name, int(value))
+        for field_name in self._FLOAT_FIELDS:
+            value = getattr(self, field_name)
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0.0:
+                raise ValueError(
+                    f"ScenePhysxCfg {field_name} must be a finite non-negative number, "
+                    f"got {value!r}"
+                )
+            object.__setattr__(self, field_name, numeric)
+        for field_name in ("gpu_max_rigid_contact_count", "gpu_max_rigid_patch_count"):
+            count = getattr(self, field_name)
+            if count <= 0:
+                raise ValueError(
+                    f"ScenePhysxCfg {field_name} must be positive, got {count!r}"
+                )
+
+    def as_kwargs(self) -> dict[str, float | int]:
+        """Return the validated field mapping for wire serialization."""
+        return {
+            "solver_type": self.solver_type,
+            "min_position_iteration_count": self.min_position_iteration_count,
+            "max_position_iteration_count": self.max_position_iteration_count,
+            "min_velocity_iteration_count": self.min_velocity_iteration_count,
+            "max_velocity_iteration_count": self.max_velocity_iteration_count,
+            "bounce_threshold_velocity": self.bounce_threshold_velocity,
+            "friction_offset_threshold": self.friction_offset_threshold,
+            "friction_correlation_distance": self.friction_correlation_distance,
+            "gpu_max_rigid_contact_count": self.gpu_max_rigid_contact_count,
+            "gpu_max_rigid_patch_count": self.gpu_max_rigid_patch_count,
+        }
+
+
+@dataclass(frozen=True)
+class EntityInitStateCfg:
+    """Articulation spawn pose for one declared entity (cold path).
+
+    A fixed-base articulation's root pose has no other write channel (root
+    writes are reset-event-owned and fixed-base root writes are fail-closed),
+    so the owner declares the spawn pose here and the worker applies it as
+    the articulation's spawn-time initial state.  Defaults mirror IsaacLab's
+    spawn defaults (origin, identity ``wxyz`` quaternion).
+    """
+
+    pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    rot_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.pos, (str, bytes)) or not isinstance(self.pos, (tuple, list)):
+            raise TypeError(f"EntityInitStateCfg pos must be an xyz triple, got {self.pos!r}")
+        if len(self.pos) != 3 or not all(math.isfinite(float(v)) for v in self.pos):
+            raise ValueError(
+                f"EntityInitStateCfg pos must be three finite numbers, got {self.pos!r}"
+            )
+        object.__setattr__(
+            self, "pos", (float(self.pos[0]), float(self.pos[1]), float(self.pos[2]))
+        )
+        rot = self.rot_wxyz
+        if isinstance(rot, (str, bytes)) or not isinstance(rot, (tuple, list)):
+            raise TypeError(f"EntityInitStateCfg rot_wxyz must be a wxyz quaternion, got {rot!r}")
+        if len(rot) != 4 or not all(math.isfinite(float(v)) for v in rot):
+            raise ValueError(
+                f"EntityInitStateCfg rot_wxyz must be four finite numbers, got {rot!r}"
+            )
+        quat = tuple(float(v) for v in rot)
+        if math.sqrt(sum(v * v for v in quat)) <= 0.0:
+            raise ValueError(f"EntityInitStateCfg rot_wxyz must be non-zero, got {rot!r}")
+        object.__setattr__(self, "rot_wxyz", quat)
+
+
+@dataclass(frozen=True)
 class SceneEntitySpec:
     """Typed cold-path declaration of one logical scene asset.
 
@@ -175,6 +305,13 @@ class SceneEntitySpec:
     cross-checked against the scanned free joint and a mismatch fails closed
     (``kinematic`` is a worker-side simulation flag and is not derivable from
     MJCF content, so it is not cross-checked).
+
+    Composition is declaration-driven — the backend never infers task
+    semantics from entity names: ``collision_enabled`` is the USD-bake
+    collision flag, ``replace_cylinders_with_capsules`` is the URDF converter
+    flag, ``init_state`` is the articulation spawn pose, and
+    ``mirrors_fixed_variant_pool`` binds a kinematic visual twin to the
+    scene's variant pool.
     """
 
     name: str
@@ -187,8 +324,7 @@ class SceneEntitySpec:
     contact_friction: tuple[float, float, float] | None = None
     """Default PhysX contact material (static, dynamic, restitution) applied to
     every collision shape of this entity after spawn.  ``None`` leaves the
-    converted-USD materials untouched and keeps legacy INIT payloads
-    byte-identical."""
+    converted-USD materials untouched."""
     contact_friction_by_body: tuple[BodyFrictionOverride, ...] = ()
     """Per-body contact-material overrides layered on ``contact_friction``.
 
@@ -203,6 +339,37 @@ class SceneEntitySpec:
     Exactly one entity per scene may declare it; plan-binding consistency
     (pool presence, entity shape, assignment) is validated fail-closed on
     the host cold path, not at construction.
+    """
+    init_state: EntityInitStateCfg | None = None
+    """Spawn-time articulation pose (see :class:`EntityInitStateCfg`).
+
+    Articulation entities only: the worker applies it as the articulation's
+    ``InitialStateCfg``.  ``None`` keeps the backend's default spawn pose.
+    """
+    collision_enabled: bool | None = None
+    """USD-bake collision flag for this entity's collision prims.
+
+    ``None`` leaves the converted-USD collision state untouched (converter
+    default: enabled); ``False`` authors ``collisionEnabled=False`` for
+    non-physical visual twins; ``True`` pins collision explicitly.
+    """
+    replace_cylinders_with_capsules: bool | None = None
+    """URDF converter flag for this entity's asset.
+
+    ``None`` keeps the materialization-based backend default: floating rigid
+    entities convert with capsule replacement (the dynamic object contract),
+    every other role keeps the converter default (no replacement).  A
+    declared value overrides the default for this entity; a fixed variant
+    pool target's flag also applies to every pool variant source.
+    """
+    mirrors_fixed_variant_pool: bool = False
+    """Whether this kinematic entity visualizes the pool target's variants.
+
+    The entity's per-environment visuals mirror the scene's fixed variant
+    pool (same per-env source, kinematic non-physical bake) instead of using
+    its own single asset.  Rigid kinematic entities only, mutually exclusive
+    with ``consumes_fixed_variant_pool``, and it requires the scene to carry
+    a plan (validated fail-closed on the host cold path).
     """
 
     def __post_init__(self) -> None:
@@ -264,6 +431,51 @@ class SceneEntitySpec:
                     "overrides without a contact_friction default; the worker tiles the "
                     "default across all shapes before applying per-body overrides "
                     "(scene_utils.py:1576-1592)"
+                )
+        if self.init_state is not None:
+            if not isinstance(self.init_state, EntityInitStateCfg):
+                raise TypeError(
+                    f"SceneEntitySpec {self.name!r} init_state must be an "
+                    f"EntityInitStateCfg, got {type(self.init_state).__name__}"
+                )
+            if self.materialization != ENTITY_MATERIALIZATION_ARTICULATION:
+                raise ValueError(
+                    f"SceneEntitySpec {self.name!r} declares init_state but "
+                    f"materialization={self.materialization!r}; spawn poses apply to "
+                    "articulation entities (rigid roots are reset-event-owned)"
+                )
+        if self.collision_enabled is not None and not isinstance(self.collision_enabled, bool):
+            raise TypeError(
+                f"SceneEntitySpec {self.name!r} collision_enabled must be a boolean or "
+                f"None, got {self.collision_enabled!r}"
+            )
+        if self.replace_cylinders_with_capsules is not None and not isinstance(
+            self.replace_cylinders_with_capsules, bool
+        ):
+            raise TypeError(
+                f"SceneEntitySpec {self.name!r} replace_cylinders_with_capsules must be "
+                f"a boolean or None, got {self.replace_cylinders_with_capsules!r}"
+            )
+        if self.mirrors_fixed_variant_pool:
+            if not isinstance(self.mirrors_fixed_variant_pool, bool):
+                raise TypeError(
+                    f"SceneEntitySpec {self.name!r} mirrors_fixed_variant_pool must be "
+                    f"a boolean, got {self.mirrors_fixed_variant_pool!r}"
+                )
+            if self.consumes_fixed_variant_pool:
+                raise ValueError(
+                    f"SceneEntitySpec {self.name!r} declares both consumes_fixed_variant_"
+                    "pool and mirrors_fixed_variant_pool; one entity either draws its "
+                    "asset from the pool or mirrors it, not both"
+                )
+            if (
+                self.materialization != ENTITY_MATERIALIZATION_RIGID
+                or self.root_mode != ENTITY_ROOT_KINEMATIC
+            ):
+                raise ValueError(
+                    f"SceneEntitySpec {self.name!r} declares mirrors_fixed_variant_pool "
+                    f"but materialization={self.materialization!r}/root_mode="
+                    f"{self.root_mode!r}; pool mirrors are kinematic rigid visual twins"
                 )
 
     @property
@@ -361,6 +573,24 @@ class SceneCfg:
     """Optional named keyframe used as the Manager-Based default state."""
     fixed_variant_plan: FixedVariantPlan | None = None
     """Immutable fixed model identities realized by a backend at construction."""
+    physx: ScenePhysxCfg | None = None
+    """Scene-level PhysX solver declaration (see :class:`ScenePhysxCfg`).
+
+    ``None`` (the default) keeps the backend's own solver defaults; a
+    declaration is consumed by PhysX-backed adapters (IsaacSim) and rejected
+    at construction by backends that cannot consume it.
+    """
+    env_grid_spacing: float | None = None
+    """Spacing in meters of the environment clone grid.
+
+    Layout only (every environment is its own collision-filtered subtree),
+    but world-frame environment origins derive from it.  ``None`` (the
+    default) keeps the backend's native layout — IsaacSim's ``GridCloner``
+    spacing of 2.0 m, matching the upstream single-asset behavior; owners
+    that need a tighter grid declare it, and backends that own their layout
+    reject the declaration at construction.  Must be a finite positive
+    number when declared.
+    """
 
 
 def validate_scene_composition_support(
@@ -369,15 +599,17 @@ def validate_scene_composition_support(
     *,
     supports_entity_assets: bool = False,
     supports_ground_plane: bool = False,
+    supports_scene_physx: bool = False,
+    supports_env_grid_spacing: bool = False,
 ) -> None:
     """Fail closed when a backend cannot consume declared scene composition.
 
-    ``SceneCfg.entity_assets`` and ``SceneCfg.ground_plane`` are composition
-    declarations: a backend that cannot materialize them must reject the scene
-    at construction instead of silently dropping content and degrading to
-    single-asset behavior.  Each adapter declares what it consumes; the
-    subprocess family routes the flags through the
-    ``_supports_entity_assets``/``_supports_ground_plane`` hooks so pooled
+    ``SceneCfg.entity_assets``, ``SceneCfg.ground_plane``, ``SceneCfg.physx``,
+    and ``SceneCfg.env_grid_spacing`` are composition/tuning declarations: a
+    backend that cannot materialize them must reject the scene at
+    construction instead of silently dropping content and degrading to its
+    default behavior.  Each adapter declares what it consumes; the subprocess
+    family routes the flags through the ``_supports_*`` hooks so pooled
     specializations own their declaration.
     """
     if scene.entity_assets and not supports_entity_assets:
@@ -391,6 +623,18 @@ def validate_scene_composition_support(
             f"{backend_label} backend does not consume the declarative ground plane "
             "(SceneCfg.ground_plane); this backend's scene floor comes from the "
             "scene model itself"
+        )
+    if scene.physx is not None and not supports_scene_physx:
+        raise NotImplementedError(
+            f"{backend_label} backend does not consume the scene-level PhysX "
+            "declaration (SceneCfg.physx); this backend's solver configuration "
+            "comes from the scene model itself"
+        )
+    if scene.env_grid_spacing is not None and not supports_env_grid_spacing:
+        raise NotImplementedError(
+            f"{backend_label} backend does not consume the environment grid "
+            "spacing declaration (SceneCfg.env_grid_spacing); this backend owns "
+            "its environment layout"
         )
 
 

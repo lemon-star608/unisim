@@ -544,7 +544,7 @@ def test_set_state_empty_rows_is_a_noop(multi_asset_backend):
 
 
 def test_set_state_cancels_staged_wrench_rows(multi_asset_backend):
-    """A reset cancels any wrench staged for the reset rows (reaudit fix P1).
+    """A reset cancels any wrench staged for the reset rows.
 
     The original clears its wrench buffers inside the task reset
     (reset_utils.py:405-406) and re-gates at the next pre-physics step, so a
@@ -574,7 +574,7 @@ def test_set_state_cancels_staged_wrench_rows(multi_asset_backend):
 
 
 # ---------------------------------------------------------------------------
-# Pre-step control registration (declared gap, interface-migration.md §5)
+# Pre-step control registration (declared gap)
 # ---------------------------------------------------------------------------
 
 
@@ -583,7 +583,7 @@ def test_set_pre_step_control_fails_closed(legacy_backend):
 
     Every physics substep is integrated inside the worker process, so a host
     callback cannot run inside one; accepting the registration would silently
-    drop it (declared gap, interface-migration.md §5).  Clearing with ``None``
+    drop it (declared gap).  Clearing with ``None``
     keeps the base unregister contract because "no callback" is this family's
     real state.
     """

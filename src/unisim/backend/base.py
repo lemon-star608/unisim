@@ -757,8 +757,7 @@ class SimBackend(abc.ABC):
         Multi-asset adapters may expose rigid scene entities (for example an
         object or a table) whose root state is not part of the primary
         articulation's generalized ``qpos``/``qvel`` vectors.  The default is
-        empty so legacy single-articulation backends keep their existing reset
-        path byte-for-byte.
+        empty so single-articulation backends keep their existing reset path.
         """
         return ()
 

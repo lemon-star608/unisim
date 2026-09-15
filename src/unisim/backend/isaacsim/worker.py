@@ -177,58 +177,174 @@ def _patch_urdf_articulation_root(usd_path: str, root_name: str) -> None:
 _CONTACT_OFFSET = 0.002  # scene_utils.py:133
 _REST_OFFSET = 0.0  # scene_utils.py:134
 
-# Scene-level PhysX configuration for the SimToolReal multi-asset path, a
-# literal port of the original repository's `_default_sim_cfg` PhysxCfg
-# (isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py:515-535).  Isaac Lab's
-# defaults differ in behavior-relevant ways: solver iteration clamps (1/255 and
-# 0/255 vs 8/8 and 0/0), the contact bounce threshold (0.5 vs 0.2), and the GPU
-# contact stream buffers (2**23 contacts / 5*2**15 patches vs 2**24 / 2**23 —
-# the original repository raised them because Lab's defaults report "Patch
-# buffer overflow detected" and kill training at its 24,576-env scale).  The
-# friction offset/correlation distances equal the PhysX defaults on both sides
-# and are kept explicit to mirror the source.  Multi-asset scenes only; the
-# legacy single-asset path keeps Isaac Lab defaults (pipeline-audit.md F1).
-SIMTOOLREAL_SCENE_PHYSX_KWARGS: dict[str, Any] = {
-    "solver_type": 1,  # 1 = TGS (matches legacy)
-    "min_position_iteration_count": 8,
-    "max_position_iteration_count": 8,
-    "min_velocity_iteration_count": 0,
-    "max_velocity_iteration_count": 0,
-    "bounce_threshold_velocity": 0.2,
-    "friction_offset_threshold": 0.04,
-    "friction_correlation_distance": 0.025,
-    "gpu_max_rigid_contact_count": 2**24,
-    "gpu_max_rigid_patch_count": 2**23,
-}
+# Scene-level PhysX and layout declarations arrive on the INIT wire; the
+# worker re-validates them at the boundary and applies exactly what the
+# scene declared.  Undeclared keys keep the worker's own defaults (Isaac
+# Lab's PhysxCfg and the GridCloner 2.0 m spacing) — task-specific tuning
+# is owner configuration, never a worker-side guess keyed off scene shape.
 
-# Original repository robot spawn pose (scene_utils.py:1811-1842, pos at
-# :1821): the iiwa stands 0.8 m behind the table.  Load-bearing for the
-# fixed-base robot — the root pose has no other write channel (fixed-base
-# root writes are fail-closed and reset events own joints plus the
-# rigid-entity roots), so a missing init_state leaves the base at the env
-# origin, inside the table (pipeline-audit.md F6).  Joint-position init
-# values stay unset: UniLab reset events write the full joint state before
-# the first step (registered structural deviation, no behavioral difference).
-SIMTOOLREAL_ROBOT_INIT_POS: tuple[float, float, float] = (0.0, 0.8, 0.0)
-SIMTOOLREAL_ROBOT_INIT_ROT_WXYZ: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
-
-# Original repository env grid spacing (`env_spacing=1.2`, SimToolReal.yaml:34 /
-# simtoolreal_env_cfg.py:572).  Layout only — every env is its own PhysX
-# subtree under replicate_physics=False — but kept identical so world-frame
-# quantities match the original environment origins.  Multi-asset scenes only;
-# the legacy single-asset path keeps its historical 2.0 (pipeline-audit.md F2).
-SIMTOOLREAL_ENV_GRID_SPACING: float = 1.2
-LEGACY_ENV_GRID_SPACING: float = 2.0
+_SCENE_PHYSX_INT_FIELDS = (
+    "solver_type",
+    "min_position_iteration_count",
+    "max_position_iteration_count",
+    "min_velocity_iteration_count",
+    "max_velocity_iteration_count",
+    "gpu_max_rigid_contact_count",
+    "gpu_max_rigid_patch_count",
+)
+_SCENE_PHYSX_FLOAT_FIELDS = (
+    "bounce_threshold_velocity",
+    "friction_offset_threshold",
+    "friction_correlation_distance",
+)
 
 
-def resolve_env_grid_spacing(entity_payloads: list[Any]) -> float:
-    """Env grid spacing for the declared scene (legacy path unchanged)."""
-    return SIMTOOLREAL_ENV_GRID_SPACING if entity_payloads else LEGACY_ENV_GRID_SPACING
+def parse_scene_physx_declaration(
+    payload_entry: Any,
+) -> dict[str, Any] | None:
+    """Re-validate the INIT ``scene_physx`` entry at the wire boundary.
+
+    Returns the validated PhysxCfg kwargs, or ``None`` when the scene
+    declares no scene-level PhysX configuration (the worker keeps Isaac
+    Lab's defaults).  A malformed declaration fails closed at INIT rather
+    than being partially applied.
+    """
+    if payload_entry is None:
+        return None
+    if not isinstance(payload_entry, dict):
+        raise TypeError(
+            "isaacsim scene_physx declaration must be a dict, got "
+            f"{type(payload_entry).__name__}"
+        )
+    expected = set(_SCENE_PHYSX_INT_FIELDS) | set(_SCENE_PHYSX_FLOAT_FIELDS)
+    if set(payload_entry) != expected:
+        raise ValueError(
+            "isaacsim scene_physx declaration keys must be exactly "
+            f"{sorted(expected)}, got {sorted(payload_entry)}"
+        )
+    result: dict[str, Any] = {}
+    for name in _SCENE_PHYSX_INT_FIELDS:
+        value = payload_entry[name]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 0:
+            raise ValueError(
+                f"isaacsim scene_physx {name} must be a non-negative integer, got {value!r}"
+            )
+        result[name] = int(value)
+    if result["solver_type"] not in (0, 1):
+        raise ValueError(
+            f"isaacsim scene_physx solver_type must be 0 (PGS) or 1 (TGS), "
+            f"got {result['solver_type']!r}"
+        )
+    for name in ("gpu_max_rigid_contact_count", "gpu_max_rigid_patch_count"):
+        if result[name] <= 0:
+            raise ValueError(
+                f"isaacsim scene_physx {name} must be positive, got {result[name]!r}"
+            )
+    for name in _SCENE_PHYSX_FLOAT_FIELDS:
+        value = float(payload_entry[name])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"isaacsim scene_physx {name} must be a finite non-negative number, "
+                f"got {payload_entry[name]!r}"
+            )
+        result[name] = value
+    return result
 
 
-def resolve_scene_physx_kwargs(entity_payloads: list[Any]) -> dict[str, Any] | None:
-    """Scene-level PhysxCfg kwargs, or None to keep Isaac Lab defaults."""
-    return dict(SIMTOOLREAL_SCENE_PHYSX_KWARGS) if entity_payloads else None
+def parse_env_grid_spacing(payload_entry: Any) -> float | None:
+    """Re-validate the INIT ``env_grid_spacing`` entry at the wire boundary.
+
+    Returns the declared spacing in meters, or ``None`` when the scene
+    leaves the layout to the worker (the ``GridCloner`` default of 2.0 m).
+    """
+    if payload_entry is None:
+        return None
+    if isinstance(payload_entry, bool) or not isinstance(payload_entry, (int, float)):
+        raise TypeError(
+            f"isaacsim env_grid_spacing must be a number, got {payload_entry!r}"
+        )
+    spacing = float(payload_entry)
+    if not math.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(
+            f"isaacsim env_grid_spacing must be a finite positive number, got {payload_entry!r}"
+        )
+    return spacing
+
+
+_InitStateParse = tuple[tuple[float, float, float], tuple[float, float, float, float]]
+
+
+def parse_entity_init_state(payload_entry: Any) -> _InitStateParse | None:
+    """Re-validate one entity's INIT ``init_state`` entry at the wire boundary.
+
+    Returns ``(pos, rot_wxyz)``, or ``None`` when the entity declares no
+    spawn pose (the worker keeps the articulation's default spawn state).
+    """
+    if payload_entry is None:
+        return None
+    if not isinstance(payload_entry, dict) or set(payload_entry) != {"pos", "rot_wxyz"}:
+        raise ValueError(
+            "isaacsim init_state declaration must be a dict with exactly "
+            f"pos/rot_wxyz keys, got {payload_entry!r}"
+        )
+    pos_raw = payload_entry["pos"]
+    rot_raw = payload_entry["rot_wxyz"]
+    if (
+        isinstance(pos_raw, (str, bytes))
+        or not isinstance(pos_raw, (tuple, list))
+        or len(pos_raw) != 3
+    ):
+        raise ValueError(
+            f"isaacsim init_state pos must be an xyz triple, got {pos_raw!r}"
+        )
+    if (
+        isinstance(rot_raw, (str, bytes))
+        or not isinstance(rot_raw, (tuple, list))
+        or len(rot_raw) != 4
+    ):
+        raise ValueError(
+            f"isaacsim init_state rot_wxyz must be a wxyz quaternion, got {rot_raw!r}"
+        )
+    pos = tuple(float(value) for value in pos_raw)
+    rot = tuple(float(value) for value in rot_raw)
+    if not all(math.isfinite(value) for value in pos + rot):
+        raise ValueError(
+            f"isaacsim init_state pos/rot_wxyz must be finite, got {payload_entry!r}"
+        )
+    if math.sqrt(sum(value * value for value in rot)) <= 0.0:
+        raise ValueError(f"isaacsim init_state rot_wxyz must be non-zero, got {rot_raw!r}")
+    return pos, rot
+
+
+def _entity_declared_bool(entry: dict[str, Any], key: str) -> bool | None:
+    """Read one declared boolean entity field, failing closed on bad types."""
+    value = entry.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"isaacsim entity {entry.get('name')!r} {key} must be a boolean, got {value!r}"
+        )
+    return value
+
+
+def _entity_capsule_flag(entry: dict[str, Any]) -> bool:
+    """Resolve the URDF converter capsule flag for one entity entry.
+
+    A declared ``replace_cylinders_with_capsules`` value is authoritative.
+    Otherwise the backend default follows the materialization: floating
+    rigid entities convert with capsule replacement (the dynamic object
+    contract, scene_utils.py:1701-1706 applies it to every object
+    conversion), while articulations and kinematic rigids keep the
+    converter default.
+    """
+    declared = _entity_declared_bool(entry, "replace_cylinders_with_capsules")
+    if declared is not None:
+        return declared
+    return (
+        str(entry.get("materialization")) == "rigid"
+        and str(entry.get("root_mode")) == "floating"
+    )
 
 
 # group: "rb" (RigidBodyAPI) or "art" (ArticulationRootAPI).
@@ -257,18 +373,26 @@ class _EntityBakePlan:
 
 
 def bake_plan_for_entity(
-    materialization: str, root_mode: str, *, role: str, is_variant_target: bool
+    materialization: str,
+    root_mode: str,
+    *,
+    collision_enabled: bool | None = None,
+    is_variant_target: bool = True,
 ) -> _EntityBakePlan:
-    """Return the original repository's bake plan for one entity role.
+    """Return the bake plan for one entity's declared materialization.
+
+    The plan derives from the declared materialization/root_mode plus the
+    entity's declared ``collision_enabled`` (the USD-bake collision flag);
+    no task semantics are inferred from entity names:
 
     - robot articulation: scene_utils.py:1730-1739 (gravity off, max
       depenetration velocity, self-collisions on, articulation solver 8/0).
-    - object variant pool: scene_utils.py:1707-1713 (dynamic, max
-      depenetration velocity, articulation API off).
-    - table (kinematic rigid): scene_utils.py:1752-1758 (kinematic, gravity
-      off, collision preserved — no ``collision_enabled`` argument).
-    - goalviz (kinematic rigid): scene_utils.py:1714-1719 (kinematic, gravity
-      off, collision disabled).
+    - floating rigid (object/pool variants): scene_utils.py:1701-1713
+      (dynamic, max depenetration velocity, articulation API off).
+    - kinematic rigid (table/goalviz): scene_utils.py:1714-1719/1752-1758
+      (kinematic, gravity off); the collision flag is the scene's
+      declaration — ``None`` keeps the converted-USD collision state
+      (the table contract), ``False`` disables it (the goalviz contract).
     """
     if materialization == "articulation":
         return _EntityBakePlan(
@@ -285,19 +409,6 @@ def bake_plan_for_entity(
     if materialization != "rigid":
         raise ValueError(f"unsupported entity materialization {materialization!r}")
     if root_mode == "kinematic":
-        # The two kinematic roles differ exactly in collision: the original
-        # goalviz bake passes collision_enabled=False (scene_utils.py:1714-1719)
-        # while the table bake passes no collision flag and keeps collision
-        # (scene_utils.py:1752-1758).  Anything else is fail-closed.
-        if role == "goalviz":
-            collision_enabled: bool | None = False
-        elif role == "table":
-            collision_enabled = None
-        else:
-            raise ValueError(
-                f"unsupported kinematic rigid entity role {role!r}; the declared "
-                "multi-asset roles are robot/table/object/goalviz"
-            )
         return _EntityBakePlan(
             props={
                 "kinematic_enabled": True,
@@ -311,7 +422,7 @@ def bake_plan_for_entity(
         raise ValueError(f"unsupported rigid entity root_mode {root_mode!r}")
     if not is_variant_target:
         raise ValueError(
-            f"unsupported non-dynamic floating rigid role {role!r}; every floating "
+            "unsupported non-dynamic floating rigid entity; every floating "
             "rigid is the dynamic object contract (scene_utils.py:1701-1713)"
         )
     return _EntityBakePlan(
@@ -706,8 +817,8 @@ def parse_ground_plane_declaration(
     """Re-validate the INIT ``ground_plane`` entry at the wire boundary.
 
     Returns ``(friction_triple, restitution, size_m)`` or ``None`` when the
-    scene declares no ground plane (the legacy render-mode-only Nucleus
-    ground path applies, interface-migration.md final review I-1).  A
+    scene declares no ground plane (the render-mode-only Nucleus ground
+    applies for rendered scenes).  A
     malformed declaration fails closed at INIT rather than silently
     spawning a default ground the scene never asked for.
     """
@@ -747,7 +858,7 @@ def parse_entity_friction(
     """Re-validate one entity's INIT friction payload at the wire boundary.
 
     Returns ``(default, overrides_by_body)`` or ``None`` when the entity
-    declares no contact materials (legacy scenes never carry the keys).
+    declares no contact materials (undeclared scenes never carry the keys).
     Per-body overrides without a default fail closed: the writer tiles the
     default across all shapes before applying overrides
     (scene_utils.py:1576-1577).
@@ -911,8 +1022,8 @@ def _verify_baked_usd(usd_path: str, plan: _EntityBakePlan) -> dict[str, int]:
             + "; ".join(mismatches[:8])
             + (f" (+{len(mismatches) - 8} more)" if len(mismatches) > 8 else "")
         )
-    # Observed collisionEnabled per collision prim (pipeline-audit.md F4):
-    # recorded for probe assertions even when the plan does not pin the flag
+    # Observed collisionEnabled per collision prim: recorded for probe
+    # assertions even when the plan does not pin the flag
     # (the table plan leaves collision untouched and must stay enabled).
     return {**counts, "collision_enabled": collision_enabled_values}
 
@@ -924,10 +1035,9 @@ def _readback_variant_masses(usd_paths: list[str]) -> list[float]:
     pool variant is a single-link rigid tool, so its USD must carry exactly
     one ``UsdPhysics.RigidBodyAPI`` prim, and the ``UsdPhysics.MassAPI``
     mass on that prim must be readable, finite, and strictly positive.
-    Provenance change (interface-migration.md ruling 9): variant mass used
-    to be echoed back from an optional INIT payload key; the payload no
-    longer carries masses, and this measurement of the materialized variant
-    USD is the only source reported through the INIT metadata.  The goalviz
+    The INIT payload never carries masses: this measurement of the
+    materialized variant USD is the only reported mass source, not a
+    payload echo.  The goalviz
     mirror pool is deliberately never measured (kinematic, non-physical).
     """
     from pxr import Usd, UsdPhysics  # type: ignore[import-not-found]
@@ -1040,15 +1150,14 @@ class _WorkerContext:
         self.sim: Any = None
         self.robot: Any = None
         # Non-articulation scene entities (table/object/goalviz), keyed by
-        # declared entity name.  Empty for legacy single-asset scenes; each
+        # declared entity name.  Empty for single-asset scenes; each
         # entry owns an entity_root_state__/entity_reset_state__ slot pair
         # (step 1.3c) attached by the host after INIT.
         self.rigid_objects: dict[str, Any] = {}
         # (target entity name, converted pool USD paths, measured per-variant
-        # masses) when an init randomization variant pool was materialized;
-        # used for the INIT round-robin forensics report and the
-        # backend-authoritative mass readback (interface-migration.md
-        # ruling 9: measurement, not payload echo).
+        # masses) when a variant pool was materialized; used for the INIT
+        # forensics report and the backend-authoritative mass readback
+        # (measurement, not payload echo).
         self._variant_pool_usds: tuple[str, list[str], list[float]] | None = None
         # (entity_name, source_pool_target, usd_paths) when a kinematic entity
         # mirrors a declared variant pool (SimToolReal goalviz, 2026-09-14).
@@ -1188,6 +1297,8 @@ class _WorkerContext:
         entity_payloads = [dict(entry) for entry in (payload.get("entities") or [])]
         variant_pool = payload.get("variant_pool")
         ground_plane = parse_ground_plane_declaration(payload.get("ground_plane"))
+        scene_physx = parse_scene_physx_declaration(payload.get("scene_physx"))
+        env_grid_spacing = parse_env_grid_spacing(payload.get("env_grid_spacing"))
         rigid_spawn_cfgs: list[tuple[str, Any]] = []
         if entity_payloads:
             # SimToolReal step-1.3a multi-asset entry: one Articulation (the
@@ -1242,8 +1353,14 @@ class _WorkerContext:
         # robot hierarchy; only these Xforms and the articulation wrapper are
         # created here, so no asset/XML parsing occurs on a hot path.  The
         # translations are private worker offsets; state is normalized back to
-        # local coordinates before it is published to the host.
-        cloner = GridCloner(spacing=resolve_env_grid_spacing(entity_payloads))
+        # local coordinates before it is published to the host.  The spacing
+        # comes from the scene declaration (``None`` keeps the GridCloner
+        # default of 2.0 m), and cloning never replicates physics or uses
+        # Fabric scene-graph instantiation — every environment is an
+        # independent copy under explicit per-env collision filtering.
+        cloner = GridCloner(
+            spacing=2.0 if env_grid_spacing is None else env_grid_spacing
+        )
         cloner.define_base_env("/World/envs")
         self.env_prim_paths = cloner.generate_paths("/World/envs/env", self.num_envs)
         # The source Xform must exist before GridCloner.clone.  The returned
@@ -1257,6 +1374,7 @@ class _WorkerContext:
                 prim_paths=self.env_prim_paths,
                 replicate_physics=False,
                 copy_from_source=True,
+                clone_in_fabric=False,
             ),
             dtype=np.float32,
         )
@@ -1277,8 +1395,8 @@ class _WorkerContext:
         # converter's nesting is asset-dependent, so discover it from the
         # converted USD stage rather than baking in the G1 layout.
         articulation_root = _resolve_articulation_root_prim_path(robot_usd_path, root_name)
-        # Entity payloads carry the per-role "joint_names" list; the legacy
-        # top-level contract keeps the historical "mjcf_joint_names" key.
+        # Entity payloads carry the per-role "joint_names" list; the
+        # single-asset contract keeps the "mjcf_joint_names" key.
         joint_names = [
             str(name)
             for name in (
@@ -1308,42 +1426,48 @@ class _WorkerContext:
                 )
             },
         )
-        if entity_payloads:
-            # SimToolReal multi-asset: the fixed-base robot's only root-pose
-            # source is this spawn-time state, so the original repository's
-            # standing position is applied here (pipeline-audit.md F6).  The
-            # legacy single-asset path keeps Isaac Lab defaults (MJCF scenes
-            # carry their own keyframe contract).
+        # The robot's spawn pose is a declaration, not a path property: the
+        # primary articulation entity may declare ``init_state`` (a
+        # fixed-base robot's root pose has no other write channel — root
+        # writes are reset-event-owned and fixed-base root writes are
+        # fail-closed); undeclared scenes keep Isaac Lab's default spawn.
+        robot_init_state = parse_entity_init_state(
+            contract_source.get("init_state")
+            if not entity_payloads
+            else robot_entry.get("init_state")
+        )
+        if robot_init_state is not None:
             robot_cfg_kwargs["init_state"] = ArticulationCfg.InitialStateCfg(
-                pos=SIMTOOLREAL_ROBOT_INIT_POS,
-                rot=SIMTOOLREAL_ROBOT_INIT_ROT_WXYZ,
+                pos=robot_init_state[0],
+                rot=robot_init_state[1],
             )
         robot_cfg = ArticulationCfg(**robot_cfg_kwargs)
-        # Multi-asset (SimToolReal) scenes apply the original repository's
-        # scene-level PhysxCfg; the legacy single-asset path keeps Isaac Lab
-        # defaults.  Isaac Lab flattens the physx config into carb settings and
-        # PhysxSceneAPI attributes at SimulationContext construction
+        # Scene-level PhysX configuration is equally a declaration: a
+        # declared ``scene_physx`` entry rebuilds the solver tuning
+        # (iteration clamps, bounce threshold, GPU contact stream buffers),
+        # an undeclared scene keeps Isaac Lab's defaults.  Isaac Lab
+        # flattens the physx config into carb settings and PhysxSceneAPI
+        # attributes at SimulationContext construction
         # (isaaclab/sim/simulation_context.py:261-266, 862-866; PhysicsContext
         # consumers at isaacsim core physics_context.py:155-188).
-        scene_physx_kwargs = resolve_scene_physx_kwargs(entity_payloads)
-        if scene_physx_kwargs is not None:
+        if scene_physx is not None:
             sim_cfg = sim_utils.SimulationCfg(
                 dt=self.sim_dt,
                 device=self.device,
-                physx=sim_utils.PhysxCfg(**scene_physx_kwargs),
+                physx=sim_utils.PhysxCfg(**scene_physx),
             )
         else:
             sim_cfg = sim_utils.SimulationCfg(dt=self.sim_dt, device=self.device)
         self.sim = sim_utils.SimulationContext(sim_cfg)
-        # Ground plane is declared scene content, not worker policy
-        # (interface-migration.md final review I-1): the original repository
+        # Ground plane is declared scene content, not worker policy: the
+        # original repository
         # assembles the floor as task-level scene composition (scene_utils.py
         # setup_scene step 5: world-level /World/ground, GroundPlaneCfg
         # defaults, spawned in training too).  A declared scene spawns the
         # offline-safe local collision ground in every runtime mode — the
         # default declaration reproduces the original GroundPlaneCfg physics
         # parameter for parameter — while an undeclared scene keeps the
-        # pre-declaration legacy behavior verbatim.
+        # backend's native ground behavior.
         if ground_plane is not None:
             ground_friction, ground_restitution, ground_size_m = ground_plane
             self._spawn_local_ground_plane(
@@ -1363,7 +1487,7 @@ class _WorkerContext:
         # construct an Articulation against an uninitialized context.
         self.robot = Articulation(robot_cfg)
         # Rigid scene entities (table/object/goalviz) spawn on the same stage
-        # and env grid; the legacy single-asset path leaves this loop empty.
+        # and env grid; scenes without rigid entities leave this loop empty.
         for entity_name, rigid_cfg in rigid_spawn_cfgs:
             self.rigid_objects[entity_name] = RigidObject(rigid_cfg)
         if render_mode != "none":
@@ -1450,8 +1574,8 @@ class _WorkerContext:
         meta: dict[str, Any] = {
             "num_dof": self.num_dof,
             "num_bodies": self.num_bodies,
-            # Runtime fixity diagnostics (training-pipeline-reaudit): the
-            # payload flag vs IsaacLab's own view of the articulation root.
+            # Runtime fixity diagnostics: the payload flag vs IsaacLab's own
+            # view of the articulation root.
             "fixed_base": bool(self._fixed_base),
             "robot_is_fixed_base": bool(getattr(self.robot, "is_fixed_base", False)),
             "robot_articulation_root": articulation_root,
@@ -1474,7 +1598,7 @@ class _WorkerContext:
             "collision_filtering_applied": self.collision_filtering_applied,
         }
         if entity_payloads:
-            # Articulation-root forensics (reaudit): which prim carries the
+            # Articulation-root forensics: which prim carries the
             # root API and how the root link is anchored.  A fixed-base
             # conversion anchors the root link to the world through a fixed
             # ``root_joint``; a second root API on the named link would make
@@ -1524,7 +1648,7 @@ class _WorkerContext:
             # FilteredPairs, plus the PhysX material write/readback summary.
             meta["bake"] = self._readback_bake(entity_payloads)
             meta["friction"] = friction_meta
-            # Scene-level PhysxCfg effective values (pipeline-audit.md F1).
+            # Scene-level PhysX effective values read back for INIT meta.
             meta["scene_physx"] = self._readback_scene_physx()
             if self._variant_pool_usds is not None:
                 target_name, pool_usds, measured_masses = self._variant_pool_usds
@@ -1567,7 +1691,7 @@ class _WorkerContext:
         ``SimulationContext._set_physics_engine_settings``; GPU contact stream
         buffers and thresholds via ``PhysicsContext`` setters), so reading the
         prim back proves the original repository's scene-level configuration
-        took effect (pipeline-audit.md F1 verification).  ``solver_type`` is
+        took effect.  ``solver_type`` is
         only authored for PGS, so a missing attribute means the TGS default.
         """
         from pxr import PhysxSchema  # type: ignore[import-not-found]
@@ -1836,6 +1960,18 @@ class _WorkerContext:
                 f"isaacsim INIT variant pool assignments must be in [0, {len(source_files)}), "
                 f"got {assignments}"
             )
+        # Only the deterministic round-robin assignment is materializable:
+        # the spawner cycles the K unique prototypes (environment i takes
+        # source i % K), so an arbitrary assignment cannot be realized
+        # without one prototype reference per environment.
+        expected_round_robin = [index % len(source_files) for index in range(self.num_envs)]
+        if assignments != expected_round_robin:
+            raise NotImplementedError(
+                "isaacsim INIT variant pool supports round-robin assignments only "
+                f"(assignment[i] == i % {len(source_files)}); an arbitrary per-env "
+                "assignment would expand to one prototype per environment — the exact "
+                "K-prototype spawner is a planned follow-up"
+            )
         if masses is not None:
             if (
                 len(masses) != len(source_files)
@@ -1889,6 +2025,10 @@ class _WorkerContext:
             name = self._validate_entity_name(entry)
             materialization = str(entry.get("materialization") or "")
             root_mode = str(entry.get("root_mode") or "")
+            # Declared composition fields are validated at the wire boundary
+            # before any conversion runs (fail-closed on bad types).
+            declared_collision = _entity_declared_bool(entry, "collision_enabled")
+            mirrors_pool = _entity_declared_bool(entry, "mirrors_fixed_variant_pool")
             if str(entry.get("asset_format") or "") != "urdf":
                 raise NotImplementedError(
                     f"isaacsim multi-asset entity {name!r} requires asset_format='urdf'; "
@@ -1909,7 +2049,7 @@ class _WorkerContext:
                     fix_base=root_mode == "fixed",
                     self_collision=True,  # scene_utils.py:1721-1725
                     with_joint_drive=True,  # scene_utils.py:1453-1458
-                    replace_cylinders_with_capsules=False,
+                    replace_cylinders_with_capsules=_entity_capsule_flag(entry),
                 )
                 _patch_urdf_articulation_root(usd_path, str(entry.get("root_body_name") or ""))
                 # scene_utils.py:1726-1729: author FilteredPairsAPI for the
@@ -1920,11 +2060,7 @@ class _WorkerContext:
                 )
                 _bake_usd_in_place(
                     usd_path,
-                    # A floating rigid role is the dynamic object contract;
-                    # table/goalviz use the explicit kinematic root mode.
-                    bake_plan_for_entity(
-                        materialization, root_mode, role=name, is_variant_target=True
-                    ),
+                    bake_plan_for_entity(materialization, root_mode),
                 )
                 entry["_usd_path"] = usd_path
                 robot_entry, robot_usd_path = entry, usd_path
@@ -1943,14 +2079,16 @@ class _WorkerContext:
                 # build_rigid_object_cfg semantics with random_choice=False):
                 # the wrapper cycles the unique pool deterministically for the
                 # task plan; arbitrary external assignments use the expanded
-                # per-environment fallback below.
+                # per-environment fallback below.  Pool variants convert with
+                # the target entity's declared converter profile.
+                pool_capsules = _entity_capsule_flag(entry)
                 pool_usds = [
                     self._convert_entity_urdf(
                         source,
                         fix_base=False,
                         self_collision=None,
                         with_joint_drive=False,
-                        replace_cylinders_with_capsules=True,  # scene_utils.py:1701-1706
+                        replace_cylinders_with_capsules=pool_capsules,
                     )
                     for source in pool["source_files"]
                 ]
@@ -1958,98 +2096,87 @@ class _WorkerContext:
                 for pool_usd in pool_usds:
                     _bake_usd_in_place(
                         pool_usd,
-                        bake_plan_for_entity(
-                            materialization, root_mode, role=name, is_variant_target=True
-                        ),
+                        bake_plan_for_entity(materialization, root_mode),
                     )
-                # Backend-authoritative mass measurement of the baked pool
-                # (SimToolReal M1.3, interface-migration.md ruling 9): the
-                # INIT payload never carries masses, so the worker reads
+                # Backend-authoritative mass measurement of the baked pool:
+                # the INIT payload never carries masses, so the worker reads
                 # each variant's physics mass back from the materialized
                 # USD, failing INIT closed on any ambiguity.  Only this
-                # dynamic object pool is measured; the goalviz mirror below
+                # dynamic object pool is measured; the mirror pool below
                 # bakes kinematic non-physical copies.
                 measured_masses = _readback_variant_masses(pool_usds)
-                assignments = pool["assignments"]
-                # ``MultiUsdFileCfg(random_choice=False)`` itself selects
-                # prototype ``env_index % len(usd_path)``.  The task-owned
-                # plan uses exactly that deterministic round-robin, so pass
-                # the 1200 unique assets rather than expanding to one path
-                # per environment (which would make IsaacLab author 12,288
-                # redundant prototypes at the production smoke size).  Keep
-                # the expanded fallback for arbitrary external assignments.
-                round_robin = assignments == [
-                    index % len(pool_usds) for index in range(self.num_envs)
-                ]
-                spawn_usds = (
-                    pool_usds
-                    if round_robin
-                    else [pool_usds[assignments[index]] for index in range(self.num_envs)]
-                )
-                entry["_usd_path"] = spawn_usds
+                entry["_usd_path"] = pool_usds
                 self._variant_pool_usds = (name, pool_usds, measured_masses)
-                # scene_utils.py:187-192: plain MultiUsdFileCfg round-robin;
-                # all physics is authored by the bake above.
-                spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
+                # scene_utils.py:187-192: plain MultiUsdFileCfg round-robin.
+                # The wire validation above admitted the deterministic
+                # round-robin assignment only, and ``random_choice=False``
+                # materializes environment i from pool_usds[i % K] by
+                # construction — K unique prototypes regardless of the
+                # environment count, never one prototype per environment.
+                # All physics is authored by the bake above.
+                spawn = MultiUsdFileCfg(usd_path=pool_usds, random_choice=False)
             elif root_mode == "kinematic":
-                # Goalviz converts object-style: the original bakes the goalviz
-                # copies from the SAME per-tool USD batch as the dynamic object
-                # (scene_utils.py:1714-1719), so every env's goalviz shows that
-                # env's tool shape.  When a variant pool targets the dynamic
-                # object, mirror the pool batch here with the goalviz role
-                # bake (kinematic, gravity off, collisionEnabled=False); the
-                # table keeps its single declared file (capsules=False,
-                # scene_utils.py:1752), and without a pool the goalviz keeps
-                # its own declared file too.
-                mirror_pool = (
-                    pool is not None and name == "goalviz" and pool["target_entity"] != name
-                )
-                if mirror_pool:
-                    pool_usds = [
+                # A kinematic entity may declare itself the pool's visual
+                # mirror: every env's copy shows that env's tool shape
+                # (the original bakes goalviz copies from the SAME per-tool
+                # USD batch, scene_utils.py:1714-1719).  The mirror bakes
+                # kinematic and non-physical; its collision flag and
+                # converter profile are its own declaration.
+                if mirrors_pool:
+                    if pool is None:
+                        raise ValueError(
+                            f"isaacsim entity {name!r} declares "
+                            "mirrors_fixed_variant_pool but the INIT payload carries "
+                            "no variant pool"
+                        )
+                    if pool["target_entity"] == name:
+                        raise ValueError(
+                            f"isaacsim entity {name!r} declares "
+                            "mirrors_fixed_variant_pool but is itself the pool target"
+                        )
+                    mirror_usds = [
                         self._convert_entity_urdf(
                             source,
                             fix_base=False,
                             self_collision=None,
                             with_joint_drive=False,
-                            replace_cylinders_with_capsules=True,
+                            replace_cylinders_with_capsules=_entity_capsule_flag(entry),
                         )
                         for source in pool["source_files"]
                     ]
-                    for pool_usd in pool_usds:
+                    for mirror_usd in mirror_usds:
                         _bake_usd_in_place(
-                            pool_usd,
+                            mirror_usd,
                             bake_plan_for_entity(
-                                materialization, root_mode, role=name, is_variant_target=False
+                                materialization,
+                                root_mode,
+                                collision_enabled=declared_collision,
                             ),
                         )
-                    assignments = pool["assignments"]
-                    round_robin = assignments == [
-                        index % len(pool_usds) for index in range(self.num_envs)
-                    ]
-                    spawn_usds = (
-                        pool_usds
-                        if round_robin
-                        else [pool_usds[assignments[index]] for index in range(self.num_envs)]
-                    )
-                    entry["_usd_path"] = spawn_usds
-                    self._goalviz_mirror = (name, str(pool["target_entity"]), pool_usds)
-                    spawn = MultiUsdFileCfg(usd_path=spawn_usds, random_choice=False)
+                    entry["_usd_path"] = mirror_usds
+                    self._goalviz_mirror = (name, str(pool["target_entity"]), mirror_usds)
+                    # Same by-construction round-robin as the pool target:
+                    # the mirror cycles the same K unique sources per env.
+                    spawn = MultiUsdFileCfg(usd_path=mirror_usds, random_choice=False)
                 else:
-                    # The table converts with the default flag, capsules=False
-                    # (scene_utils.py:1752).  The bake authors
-                    # kinematic/gravity and, for the goalviz only,
-                    # collisionEnabled=False.
+                    # Single-file kinematic entity (the table contract):
+                    # converter profile and collision flag are declarations,
+                    # with the materialization defaults keeping the
+                    # converted-USD collision state and the converter's
+                    # capsule behavior.
                     usd_path = self._convert_entity_urdf(
                         os.fspath(entry["model_file"]),
                         fix_base=False,
                         self_collision=None,
                         with_joint_drive=False,
-                        replace_cylinders_with_capsules=(name == "goalviz"),
+                        replace_cylinders_with_capsules=_entity_capsule_flag(entry),
                     )
                     _bake_usd_in_place(
                         usd_path,
                         bake_plan_for_entity(
-                            materialization, root_mode, role=name, is_variant_target=False
+                            materialization,
+                            root_mode,
+                            collision_enabled=declared_collision,
                         ),
                     )
                     entry["_usd_path"] = usd_path
@@ -2065,13 +2192,11 @@ class _WorkerContext:
                     fix_base=False,
                     self_collision=None,
                     with_joint_drive=False,
-                    replace_cylinders_with_capsules=True,
+                    replace_cylinders_with_capsules=_entity_capsule_flag(entry),
                 )
                 _bake_usd_in_place(
                     usd_path,
-                    bake_plan_for_entity(
-                        materialization, root_mode, role=name, is_variant_target=True
-                    ),
+                    bake_plan_for_entity(materialization, root_mode),
                 )
                 entry["_usd_path"] = usd_path
                 spawn = UsdFileCfg(usd_path=usd_path)
@@ -2165,7 +2290,7 @@ class _WorkerContext:
         }
         # Armature and effort limits are applied through the same override
         # channel; record their effective values so probes can close the
-        # readback loop (pipeline-audit.md S05).
+        # readback loop.
         armature = getattr(actuator, "armature", None)
         effort = getattr(actuator, "effort_limit_sim", None)
         for name, values in (("armature", armature), ("effort_limit", effort)):
@@ -2313,7 +2438,7 @@ class _WorkerContext:
             plan = bake_plan_for_entity(
                 str(entry["materialization"]),
                 str(entry["root_mode"]),
-                role=name,
+                collision_enabled=_entity_declared_bool(entry, "collision_enabled"),
                 is_variant_target=is_pool_target or is_dynamic_rigid,
             )
             if is_pool_target:
@@ -2533,7 +2658,7 @@ class _WorkerContext:
             detail_timing["refresh_contact_slot_clear_ms"] = (time.perf_counter() - t0) * 1000.0
         # Rigid scene entities (1.3c): publish each root's world state (pos
         # xyz, quat wxyz, lin vel, world ang vel) in local frame.  The loop is
-        # empty for legacy single-asset scenes.
+        # empty for scenes without rigid entities.
         for name, rigid in self.rigid_objects.items():
             rigid_t0 = time.perf_counter()
             rigid_state = rigid.data.root_link_state_w
@@ -2688,8 +2813,7 @@ class _WorkerContext:
         # state and any rigid entity roots are written against the same env
         # rows.  ``robot=False`` (multi-asset scenes only) leaves the robot
         # untouched, so a goalviz-only reset cannot perturb object/robot state
-        # (DESIGN.md §4).  Legacy payloads carry neither key and always write
-        # the robot, byte-identical to before.
+        # (DESIGN.md §4).  Payloads carrying neither key write the robot.
         robot_write = bool(payload.get("robot", True))
         entity_names = [str(name) for name in (payload.get("entity_roots") or [])]
         if len(set(entity_names)) != len(entity_names):
@@ -2811,9 +2935,9 @@ class _WorkerContext:
             "render_height": self.render_height,
             "env_origins": self.env_origins.tolist(),
             "collision_filtering_applied": self.collision_filtering_applied,
-            # Runtime fixity diagnostics (training-pipeline-reaudit): the
-            # payload flag vs IsaacLab's own view of the articulation root.
-            # These must agree and be True for SimToolReal's fixed-base robot.
+            # Runtime fixity diagnostics: the payload flag vs IsaacLab's own
+            # view of the articulation root.  These must agree and be True for
+            # a fixed-base robot.
             "fixed_base": bool(self._fixed_base),
             "robot_is_fixed_base": bool(getattr(self.robot, "is_fixed_base", False)),
         }

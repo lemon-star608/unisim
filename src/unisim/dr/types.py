@@ -166,8 +166,8 @@ class FixedVariantMetadata:
     expands the per-variant measurement table with the pool's assignment.
     ``variant_files`` is the diagnostic source list of the materialized
     pool.  Backend-authoritative; assignment/scale deliberately out of
-    scope (entity-scoped variant attribute flow pends upstream, see
-    interface-migration.md K4).
+    scope (entity-scoped variant attribute flow pends an upstream
+    contract).
     """
 
     mass: np.ndarray
