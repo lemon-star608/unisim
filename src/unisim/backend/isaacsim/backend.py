@@ -104,6 +104,22 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         self._render_width = int(render_width)
         self._render_height = int(render_height)
 
+    def _supports_fixed_variant_plans(self) -> bool:
+        """Accept pooled scenes through the family constructor gate."""
+        return True
+
+    def _fixed_variant_init_payload(self) -> dict[str, Any]:
+        """Keep the legacy INIT fields; the pool rides ``variant_pool``.
+
+        The isaacsim pool realizes variants through the entity-bound
+        ``variant_pool`` channel (worker-side URDF-to-USD pool), so the
+        base builder's per-variant identity payload does not apply: its
+        MJCF scan of the variant sources would reject the URDF pool, and
+        the legacy ``keyframe_qpos``/``position_actuation`` INIT fields
+        keep the SimToolReal training-time payload shape.
+        """
+        return {}
+
     def _resolve_render_mode(self) -> str:
         """Resolve eval intent before Kit is launched."""
         requested = self._requested_render_mode
