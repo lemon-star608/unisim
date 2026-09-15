@@ -28,6 +28,7 @@ from unisim.backend.isaacgym.backend import IsaacGymWorkerError
 from unisim.backend.subprocess_ipc.backend import (
     MjcfSubprocessBackend,
     SubprocessModelInfo,
+    build_init_variant_pool_payload,
 )
 from unisim.backend.subprocess_ipc.sensors import (
     KIND_CONTACT_FOUND,
@@ -101,6 +102,14 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         self._requested_render_mode = mode
         self._resolved_render_mode: str | None = None
         super().__init__(scene, num_envs, sim_dt, **kwargs)
+        # The entity-bound pool channel owns this backend's fixed-variant
+        # realization (SimToolReal's worker-side URDF-to-USD pool), so the
+        # family's model-level identity machinery must not engage: the base
+        # builder scans variant sources as MJCF and the INIT handshake
+        # validates a per-variant identity echo, both of which reject URDF
+        # pools.  Every model-level path guards on this attribute, and the
+        # constructor gate above already accepted the plan.
+        self._fixed_variant_plan = None
         self._render_width = int(render_width)
         self._render_height = int(render_height)
 
@@ -108,17 +117,38 @@ class IsaacSimBackend(MjcfSubprocessBackend):
         """Accept pooled scenes through the family constructor gate."""
         return True
 
-    def _fixed_variant_init_payload(self) -> dict[str, Any]:
-        """Keep the legacy INIT fields; the pool rides ``variant_pool``.
+    def materialize(self) -> None:
+        """Stage the entity-bound variant pool, then materialize the worker.
 
-        The isaacsim pool realizes variants through the entity-bound
-        ``variant_pool`` channel (worker-side URDF-to-USD pool), so the
-        base builder's per-variant identity payload does not apply: its
-        MJCF scan of the variant sources would reject the URDF pool, and
-        the legacy ``keyframe_qpos``/``position_actuation`` INIT fields
-        keep the SimToolReal training-time payload shape.
+        This backend's realization of ``fixed_variant_plan`` is the
+        entity-bound pool channel: exactly one scene entity declares
+        ``consumes_fixed_variant_pool`` and the validated pool rides the
+        INIT ``variant_pool`` key while the legacy keyframe/actuation
+        fields keep the training-time payload shape.  Every direction
+        fails closed here, before any worker process is spawned: a plan
+        without exactly one declared consumer, a consumer without a plan,
+        or a consumer whose entity shape cannot host a variant pool.
         """
-        return {}
+        plan = self._scene.fixed_variant_plan
+        declared = [
+            spec for spec in self._scene.entity_assets if spec.consumes_fixed_variant_pool
+        ]
+        if plan is None:
+            if declared:
+                names = sorted(spec.name for spec in declared)
+                raise ValueError(
+                    f"{self._BACKEND_LABEL} scene entities {names} declare "
+                    "consumes_fixed_variant_pool=True but the scene carries no "
+                    "fixed_variant_plan; refusing to materialize a partial variant channel"
+                )
+        else:
+            self._init_variant_pool = build_init_variant_pool_payload(
+                plan,
+                num_envs=self._num_envs,
+                entity_assets=tuple(self._scene.entity_assets),
+                backend_label=self._BACKEND_LABEL,
+            )
+        super().materialize()
 
     def _resolve_render_mode(self) -> str:
         """Resolve eval intent before Kit is launched."""

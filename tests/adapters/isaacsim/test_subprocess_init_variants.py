@@ -33,9 +33,9 @@ import numpy as np
 import pytest
 
 from unisim.backend.base import SimBackend
+from unisim.backend.isaacsim.backend import IsaacSimBackend
 from unisim.backend.subprocess_ipc import protocol
 from unisim.backend.subprocess_ipc.backend import (
-    MjcfSubprocessBackend,
     build_init_variant_pool_payload,
 )
 from unisim.dr.interval import INTERVAL_TERM_BODY_FORCE, INTERVAL_TERM_BODY_TORQUE
@@ -124,6 +124,15 @@ def _worker_meta():
         "body_names": ["base_link", "arm"],
         "gravity": [0.0, 0.0, -9.81],
         "entities": [{"name": "object", "materialization": "rigid", "root_mode": "floating"}],
+        # IsaacSimBackend's metadata binding also requires the render startup
+        # fields, unique per-env world origins, and the collision-filtering
+        # confirmation the real worker always reports.
+        "graphics_enabled": False,
+        "render_mode": "none",
+        "render_width": 1280,
+        "render_height": 720,
+        "env_origins": [[float(index), 0.0, 0.0] for index in range(NUM_ENVS)],
+        "collision_filtering_applied": True,
     }
 
 
@@ -165,8 +174,13 @@ class _FakeWorkerProcess:
         return None
 
 
-class _FakeWorkerBackend(MjcfSubprocessBackend):
-    """Record every worker request and answer the INIT/ATTACH handshake."""
+class _FakeWorkerBackend(IsaacSimBackend):
+    """Record every worker request and answer the INIT/ATTACH handshake.
+
+    Subclasses the real IsaacSim backend so the pool tests exercise the
+    entity-bound staging path (its ``materialize`` override) rather than a
+    stand-in re-implementation.
+    """
 
     def __init__(
         self, scene: SceneCfg, num_envs: int = NUM_ENVS, init_meta: dict | None = None
@@ -179,7 +193,7 @@ class _FakeWorkerBackend(MjcfSubprocessBackend):
         return Path(__file__)
 
     def _resolve_worker_runtime(self):
-        return types.SimpleNamespace(python=sys.executable)
+        return types.SimpleNamespace(python=sys.executable, isaaclab_source=None)
 
     def _build_worker_environment(self, runtime):
         del runtime
@@ -328,11 +342,10 @@ def test_missing_source_file_fails_closed(variant_files, robot_file, tmp_path):
 
 
 def test_assignment_shape_mismatch_fails_closed(variant_files, robot_file):
-    backend = _backend(
-        robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2])
-    )
+    # The upstream family constructor gate validates plan assignment shapes at
+    # construction time; the same mismatch used to surface at materialize.
     with pytest.raises(ValueError, match=r"shape \(4,\)"):
-        backend.materialize()
+        _backend(robot_file, [_object_spec(str(variant_files[0]))], _plan(variant_files, [0, 1, 2]))
 
 
 # ---------------------------------------------------------------------------
