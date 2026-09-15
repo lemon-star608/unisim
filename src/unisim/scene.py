@@ -197,6 +197,13 @@ class SceneEntitySpec:
     overrides on a rigid entity, or without a ``contact_friction`` default,
     fails closed at construction.
     """
+    consumes_fixed_variant_pool: bool = False
+    """Whether this entity's asset is drawn from ``SceneCfg.fixed_variant_plan``.
+
+    Exactly one entity per scene may declare it; plan-binding consistency
+    (pool presence, entity shape, assignment) is validated fail-closed on
+    the host cold path, not at construction.
+    """
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
